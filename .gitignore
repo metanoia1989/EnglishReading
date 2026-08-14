@@ -1,0 +1,14 @@
+# Go
+backend/english-reading
+backend/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# OS / editor
+.DS_Store
+*.log
