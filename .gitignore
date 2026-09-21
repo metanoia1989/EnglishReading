@@ -9,6 +9,13 @@ backend/data/
 frontend/node_modules/
 frontend/dist/
 
+# Content root (article bodies live here; it is data, not source)
+backend/data/content/
+data/content/
+
+# One-time migration safety copies written by the paragraph->hash migration
+legacy-anchor-backup-*.json
+
 # OS / editor
 .DS_Store
 *.log

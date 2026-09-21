@@ -13,6 +13,8 @@ const router = useRouter()
 const article = ref(null)
 const dataset = ref(null)
 const paragraphs = ref([])
+// The whole article payload, kept for the stale-anchor count it carries.
+const articleDetail = ref(null)
 const leftArticles = ref([])
 const loading = ref(true)
 const loadError = ref('')
@@ -46,7 +48,7 @@ const popup = reactive({
 const noteEditor = reactive({
   open: false,
   title: '',
-  paragraphId: null,
+  paragraphHash: null,
   sentenceIndex: -1,
   saving: false,
 })
@@ -54,6 +56,15 @@ const noteEditor = reactive({
 const mainEl = ref(null)
 const activeAnchor = ref('')
 let observer = null
+
+// publishedLabel renders the article's date when the content file carries one.
+const publishedLabel = computed(() => {
+  const raw = article.value?.publishedAt
+  if (!raw) return ''
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return ''
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+})
 
 // ---------- data loading ----------
 
@@ -65,6 +76,7 @@ async function loadArticle(id) {
     article.value = data.article
     dataset.value = data.dataset
     paragraphs.value = data.paragraphs
+    articleDetail.value = data
     document.title = `${data.article.title} · 拾句`
 
     const tasks = []
@@ -147,10 +159,10 @@ function showToast(message) {
 const toc = computed(() =>
   paragraphs.value.flatMap((p) => {
     if (p.kind === 'heading') {
-      return [{ id: `p-${p.id}`, label: p.content, heading: true }]
+      return [{ id: `p-${p.hash}`, label: p.content, heading: true }]
     }
     const preview = p.content.length > 22 ? `${p.content.slice(0, 22)}…` : p.content
-    return [{ id: `p-${p.id}`, label: `¶ ${p.seq}  ${preview}`, heading: false }]
+    return [{ id: `p-${p.hash}`, label: `¶ ${p.index}  ${preview}`, heading: false }]
   }),
 )
 
@@ -205,7 +217,7 @@ function normalizeWord(raw) {
 
 function onWordClick(paragraph, token, event) {
   popup.context = {
-    paragraphId: paragraph.id,
+    paragraphHash: paragraph.hash,
     sentenceIndex: token.sentence.index,
     wordIndex: token.wordIndex,
     word: token.text,
@@ -235,7 +247,7 @@ function onWordClick(paragraph, token, event) {
   contentApi
     .lookup(popup.word)
     .then((data) => {
-      if (popup.context?.paragraphId !== paragraph.id || popup.context?.wordIndex !== token.wordIndex) return
+      if (popup.context?.paragraphHash !== paragraph.hash || popup.context?.wordIndex !== token.wordIndex) return
       popup.word = data.word
       popup.phonetic = data.phonetic || ''
       popup.senses = data.senses || []
@@ -265,7 +277,7 @@ const popupExisting = computed(() => {
   return (
     wordAnnotations.value.find(
       (a) =>
-        a.paragraphId === popup.context.paragraphId &&
+        a.paragraphHash === popup.context.paragraphHash &&
         a.sentenceIndex === popup.context.sentenceIndex &&
         a.wordIndex === popup.context.wordIndex,
     ) || null
@@ -282,7 +294,7 @@ async function chooseSense(sense) {
   if (!popup.context || !requireLogin()) return
   try {
     const saved = await contentApi.saveWordAnnotation(route.params.id, {
-      paragraph_id: popup.context.paragraphId,
+      paragraph_hash: popup.context.paragraphHash,
       sentence_index: popup.context.sentenceIndex,
       word_index: popup.context.wordIndex,
       word: popup.context.word,
@@ -290,7 +302,7 @@ async function chooseSense(sense) {
       sense: sense.def,
     })
     const sameKey = (a) =>
-      a.paragraphId === saved.paragraphId &&
+      a.paragraphHash === saved.paragraphHash &&
       a.sentenceIndex === saved.sentenceIndex &&
       a.wordIndex === saved.wordIndex
     wordAnnotations.value = [...wordAnnotations.value.filter((a) => !sameKey(a)), saved]
@@ -313,10 +325,10 @@ async function removeWordAnnotation(annotation) {
 
 // ---------- translations ----------
 
-function translationFor(paragraphId, sentenceIndex) {
+function translationFor(paragraphHash, sentenceIndex) {
   return (
     translations.value.find(
-      (t) => t.paragraphId === paragraphId && t.sentenceIndex === sentenceIndex,
+      (t) => t.paragraphHash === paragraphHash && t.sentenceIndex === sentenceIndex,
     ) || null
   )
 }
@@ -327,17 +339,17 @@ function isBusy(key) {
 
 async function translate(paragraph, sentenceIndex) {
   if (!requireLogin()) return
-  const key = `${paragraph.id}:${sentenceIndex}`
+  const key = `${paragraph.hash}:${sentenceIndex}`
   if (busy.has(key)) return
   busy.add(key)
   try {
     const saved = await contentApi.translate(route.params.id, {
-      paragraph_id: paragraph.id,
+      paragraph_hash: paragraph.hash,
       sentence_index: sentenceIndex,
     })
     translations.value = [
       ...translations.value.filter(
-        (t) => !(t.paragraphId === saved.paragraphId && t.sentenceIndex === saved.sentenceIndex),
+        (t) => !(t.paragraphHash === saved.paragraphHash && t.sentenceIndex === saved.sentenceIndex),
       ),
       saved,
     ]
@@ -370,9 +382,9 @@ async function removeTranslation(translation) {
 
 function openNote(paragraph, sentence = null) {
   if (!requireLogin()) return
-  noteEditor.paragraphId = paragraph.id
+  noteEditor.paragraphHash = paragraph.hash
   noteEditor.sentenceIndex = sentence ? sentence.index : -1
-  noteEditor.title = sentence ? `句子批注 · ${paragraph.seq}-${sentence.index + 1}` : `段落批注 · 第 ${paragraph.seq} 段`
+  noteEditor.title = sentence ? `句子批注 · ${paragraph.index}-${sentence.index + 1}` : `段落批注 · 第 ${paragraph.index} 段`
   noteEditor.open = true
 }
 
@@ -380,7 +392,7 @@ async function saveNote(content) {
   noteEditor.saving = true
   try {
     const saved = await contentApi.createNote(route.params.id, {
-      paragraph_id: noteEditor.paragraphId,
+      paragraph_hash: noteEditor.paragraphHash,
       sentence_index: noteEditor.sentenceIndex,
       content,
     })
@@ -404,13 +416,13 @@ async function removeNote(note) {
   }
 }
 
-function notesFor(paragraphId, sentenceIndex) {
-  return notes.value.filter((n) => n.paragraphId === paragraphId && n.sentenceIndex === sentenceIndex)
+function notesFor(paragraphHash, sentenceIndex) {
+  return notes.value.filter((n) => n.paragraphHash === paragraphHash && n.sentenceIndex === sentenceIndex)
 }
 
-function wordAnnFor(paragraphId, sentenceIndex) {
+function wordAnnFor(paragraphHash, sentenceIndex) {
   return wordAnnotations.value.filter(
-    (a) => a.paragraphId === paragraphId && a.sentenceIndex === sentenceIndex,
+    (a) => a.paragraphHash === paragraphHash && a.sentenceIndex === sentenceIndex,
   )
 }
 
@@ -499,26 +511,34 @@ const nextArticle = computed(() =>
             <p v-if="article.subtitle" class="subtitle">{{ article.subtitle }}</p>
             <p class="meta">
               <span v-if="article.level" class="level-tag">{{ article.level }}</span>
+              <span v-if="article.author" class="author">{{ article.author }}</span>
+              <span v-if="publishedLabel" class="published">{{ publishedLabel }}</span>
               <span>{{ paragraphs.filter((p) => p.kind === 'text').length }} 段 · 点击单词查词，悬停句子可翻译或批注</span>
             </p>
           </header>
 
-          <section v-for="p in paragraphs" :key="p.id">
-            <h2 v-if="p.kind === 'heading'" :id="`p-${p.id}`" class="para-heading" data-anchor>
+          <!-- Anchors whose paragraph text changed are reported, never deleted. -->
+          <div v-if="articleDetail && articleDetail.staleAnchors > 0" class="stale-notice">
+            原文有段落被修改过：<b>{{ articleDetail.staleAnchors }}</b> 处标注已无法定位到原文（未删除）。
+            如需清理，请在对应位置重新标注或移除。
+          </div>
+
+          <section v-for="p in paragraphs" :key="p.hash">
+            <h2 v-if="p.kind === 'heading'" :id="`p-${p.hash}`" class="para-heading" data-anchor>
               {{ p.content }}
             </h2>
 
-            <div v-else :id="`p-${p.id}`" class="paragraph-card" data-anchor>
-              <div class="para-meta">第 {{ p.seq }} 段 · {{ p.sentences.length }} 句</div>
+            <div v-else :id="`p-${p.hash}`" class="paragraph-card" data-anchor>
+              <div class="para-meta">第 {{ p.index }} 段 · {{ p.sentences.length }} 句</div>
 
               <SentenceItem
                 v-for="s in p.sentences"
-                :key="`${p.id}-${s.index}`"
+                :key="`${p.hash}-${s.index}`"
                 :sentence="s"
-                :word-annotations="wordAnnFor(p.id, s.index)"
-                :translation="translationFor(p.id, s.index)"
-                :notes="notesFor(p.id, s.index)"
-                :busy="isBusy(`${p.id}:${s.index}`)"
+                :word-annotations="wordAnnFor(p.hash, s.index)"
+                :translation="translationFor(p.hash, s.index)"
+                :notes="notesFor(p.hash, s.index)"
+                :busy="isBusy(`${p.hash}:${s.index}`)"
                 @word-click="(token, ev) => onWordClick(p, token, ev)"
                 @translate="translateSentence(p, s)"
                 @annotate="openNote(p, s)"
@@ -528,21 +548,21 @@ const nextArticle = computed(() =>
               />
 
               <!-- 段落级翻译 / 批注：放在整段下方，与句子级区分样式 -->
-              <div v-if="translationFor(p.id, -1)" class="para-translation">
+              <div v-if="translationFor(p.hash, -1)" class="para-translation">
                 <span class="para-line-tag">段译</span>
-                <span class="para-line-content">{{ translationFor(p.id, -1).translatedText }}</span>
-                <button class="para-line-close" @click="removeTranslation(translationFor(p.id, -1))">×</button>
+                <span class="para-line-content">{{ translationFor(p.hash, -1).translatedText }}</span>
+                <button class="para-line-close" @click="removeTranslation(translationFor(p.hash, -1))">×</button>
               </div>
 
-              <div v-for="n in notesFor(p.id, -1)" :key="n.id" class="para-note">
+              <div v-for="n in notesFor(p.hash, -1)" :key="n.id" class="para-note">
                 <span class="para-line-tag">段批</span>
                 <span class="para-line-content">{{ n.content }}</span>
                 <button class="para-line-close" @click="removeNote(n)">×</button>
               </div>
 
               <div class="para-actions">
-                <button class="btn btn-ghost para-btn" :disabled="isBusy(`${p.id}:-1`)" @click="translateParagraph(p)">
-                  {{ translationFor(p.id, -1) ? '重新生成段译' : '翻译整段' }}
+                <button class="btn btn-ghost para-btn" :disabled="isBusy(`${p.hash}:-1`)" @click="translateParagraph(p)">
+                  {{ translationFor(p.hash, -1) ? '重新生成段译' : '翻译整段' }}
                 </button>
                 <button class="btn btn-ghost para-btn" @click="openNote(p)">段落批注</button>
               </div>
@@ -807,6 +827,22 @@ const nextArticle = computed(() =>
 .article {
   max-width: 760px;
   margin: 0 auto;
+}
+
+.author,
+.published {
+  color: var(--muted);
+}
+
+.stale-notice {
+  margin: 0 0 14px;
+  padding: 9px 12px;
+  border-radius: 9px;
+  border-left: 3px solid #fcd34d;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 13px;
+  line-height: 1.6;
 }
 
 .article-head {

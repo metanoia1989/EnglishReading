@@ -3,11 +3,13 @@ package seed
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"gorm.io/gorm"
 
+	"english-reading/backend/internal/content"
 	"english-reading/backend/internal/store"
 )
 
@@ -71,25 +73,14 @@ func TestSeedImportsEverything(t *testing.T) {
 				t.Errorf("dictionary rows = %d, want 89501", dict)
 			}
 
-			var datasets, articles, paragraphs int64
+			// Articles are no longer seeded into the database: their bodies
+			// live in the content tree and are indexed by content.Sync. The
+			// dictionary is all this package still writes.
+			var datasets, articles int64
 			db.Model(&store.Dataset{}).Count(&datasets)
 			db.Model(&store.Article{}).Count(&articles)
-			db.Model(&store.Paragraph{}).Count(&paragraphs)
-			if datasets != 3 {
-				t.Errorf("datasets = %d, want 3", datasets)
-			}
-			if articles != 10 {
-				t.Errorf("articles = %d, want 10", articles)
-			}
-			if paragraphs == 0 {
-				t.Error("no paragraphs imported")
-			}
-
-			// The heading paragraph of each article must exist for the TOC.
-			var headings int64
-			db.Model(&store.Paragraph{}).Where("kind = ?", "heading").Count(&headings)
-			if headings != articles {
-				t.Errorf("heading paragraphs = %d, want one per article (%d)", headings, articles)
+			if datasets != 0 || articles != 0 {
+				t.Errorf("seed must not write articles: datasets=%d articles=%d", datasets, articles)
 			}
 		})
 	}
@@ -119,11 +110,71 @@ func TestSeedIsIdempotent(t *testing.T) {
 
 			var articles int64
 			db.Model(&store.Article{}).Count(&articles)
-			if articles != 10 {
-				t.Errorf("articles after re-seed = %d, want 10", articles)
+			if articles != 0 {
+				t.Errorf("articles after re-seed = %d, want 0 (bodies live in files)", articles)
 			}
 		})
 	}
+}
+
+// The starter corpus must land in an empty tree, and must never touch a tree
+// that already has content — the tree is the source of truth after first run.
+func TestMaterializeStarterRespectsExistingContent(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping full dictionary import in -short mode")
+	}
+	db := openTestDB(t)
+	if err := Run(db); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	root := t.TempDir()
+	cs, err := content.Open(root)
+	if err != nil {
+		t.Fatalf("open content: %v", err)
+	}
+
+	// Empty tree: the starter is written.
+	if err := MaterializeStarter(db, cs); err != nil {
+		t.Fatalf("materialize starter: %v", err)
+	}
+	datasets, bad := cs.Scan()
+	if len(bad) > 0 {
+		t.Fatalf("scan reported %d bad file(s): %v", len(bad), bad[0])
+	}
+	total := 0
+	for _, ds := range datasets {
+		total += len(ds.Articles)
+	}
+	if total == 0 {
+		t.Fatal("starter corpus produced no article files")
+	}
+
+	// A tree with content is left alone, even when a file was edited by hand.
+	first := datasets[0].Articles[0]
+	abs, err := cs.Resolve(first.RelPath)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	edited := strings.Replace(string(mustRead(t, abs)), first.Paragraphs[0], "EDITED BY HAND", 1)
+	if err := os.WriteFile(abs, []byte(edited), 0o644); err != nil {
+		t.Fatalf("edit file: %v", err)
+	}
+	if err := MaterializeStarter(db, cs); err != nil {
+		t.Fatalf("second materialize: %v", err)
+	}
+	if got := string(mustRead(t, abs)); !strings.Contains(got, "EDITED BY HAND") {
+		t.Error("existing content was overwritten by the starter corpus")
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return raw
 }
 
 // The meta upsert must update in place rather than error on the second write.

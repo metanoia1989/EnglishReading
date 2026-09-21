@@ -14,12 +14,14 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"english-reading/backend/internal/content"
 	"english-reading/backend/internal/translate"
 )
 
 // Server bundles the HTTP API dependencies.
 type Server struct {
 	db        *gorm.DB
+	content   *content.Store
 	translate *translate.Client
 }
 
@@ -44,8 +46,11 @@ func upsertOnColumns(conflictColumns, updateColumns []string) clause.OnConflict 
 
 // New builds the router, including CORS, API routes and (when a built
 // frontend directory exists) the SPA static handler.
-func New(db *gorm.DB, frontendDist string) http.Handler {
-	s := &Server{db: db, translate: translate.New()}
+//
+// cs is the content root that article bodies are read from; the database only
+// holds the index of it.
+func New(db *gorm.DB, cs *content.Store, frontendDist string) http.Handler {
+	s := &Server{db: db, content: cs, translate: translate.New()}
 
 	mux := http.NewServeMux()
 

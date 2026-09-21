@@ -55,36 +55,57 @@ type PendingRegistration struct {
 	ExpiresAt    time.Time `gorm:"not null"`
 }
 
-// Dataset groups articles into a themed collection.
+// Dataset groups articles into a themed collection. Its articles live on disk
+// under <CONTENT_ROOT>/<Dir>; see internal/content.
 type Dataset struct {
-	ID          int64  `gorm:"primaryKey"`
-	Slug        string `gorm:"size:96;not null;uniqueIndex"`
+	ID   int64  `gorm:"primaryKey"`
+	Slug string `gorm:"size:96;not null;uniqueIndex"`
+	// default:'' keeps the one-time ADD COLUMN portable; see AGENTS §4.1 for why
+	// a default whose value equals the zero value is safe.
+	Dir         string `gorm:"size:191;not null;default:'';uniqueIndex"`
 	Title       string `gorm:"size:191;not null"`
 	Description string `gorm:"size:512;not null;default:''"`
 	Emoji       string `gorm:"size:16;not null;default:'📚'"`
 	Color       string `gorm:"size:32;not null;default:'#6366f1'"`
 }
 
-// Article belongs to a Dataset.
+// Article is an index row for one JSON file under the content root. The body
+// lives in the file; this row only carries what lists and lookups need, which
+// is why it has no paragraph children any more.
+//
+// RelPath is the slash-separated path relative to <CONTENT_ROOT> and is UNIQUE.
+// ContentHash is derived from the paragraph hashes of the file's contents, so
+// any edit to the body changes it — that is how a stale annotation is detected
+// instead of silently sliding onto the wrong word. ParagraphCount and
+// SentenceCount are denormalised purely so the article list never has to open a
+// file or run a COUNT subquery. There is no updated_at: the content hash and
+// the sync report already say when a row changed.
+//
+// Every one of these columns carries an explicit `default:` because they are
+// added to an existing table by the one-time migration, and SQLite refuses
+// `ADD COLUMN ... NOT NULL` without one. Each default equals the field's zero
+// value, which is the safe case described in §4.1 — the rule there exists to
+// stop a default that *differs* from the zero value silently rewriting data,
+// as SentenceIndex's old default:-1 did.
 type Article struct {
-	ID        int64     `gorm:"primaryKey"`
-	DatasetID int64     `gorm:"not null;index"`
-	Title     string    `gorm:"size:512;not null"`
-	Subtitle  string    `gorm:"size:512;not null;default:''"`
-	Level     string    `gorm:"size:64;not null;default:''"`
+	ID             int64      `gorm:"primaryKey"`
+	DatasetID      int64      `gorm:"not null;index"`
+	Title          string     `gorm:"size:512;not null"`
+	Subtitle       string     `gorm:"size:512;not null;default:''"`
+	Level          string     `gorm:"size:64;not null;default:''"`
+	Author         string     `gorm:"size:191;not null;default:''"`
+	Origin         string     `gorm:"size:512;not null;default:''"`
+	PublishedAt    *time.Time `gorm:"index"`
+	RelPath        string     `gorm:"size:512;not null;default:'';uniqueIndex"`
+	ContentHash    string     `gorm:"size:64;not null;default:'';index"`
+	ParagraphCount int        `gorm:"not null;default:0"`
+	SentenceCount  int        `gorm:"not null;default:0"`
+	// Missing marks an index row whose file disappeared from the content root.
+	// Such rows are hidden from listings but keep their annotations, so putting
+	// the file back restores the article and everything anchored to it.
+	Missing   bool      `gorm:"not null;default:false;index"`
 	CreatedAt time.Time `gorm:"not null"`
 	Dataset   *Dataset  `gorm:"foreignKey:DatasetID;constraint:OnDelete:CASCADE"`
-}
-
-// Paragraph is a heading or a body block. Body sentences are split at read
-// time, so sentence anchors stay stable as paragraph_id + sentence_index.
-type Paragraph struct {
-	ID        int64    `gorm:"primaryKey"`
-	ArticleID int64    `gorm:"not null;index:idx_paragraphs_article,priority:1"`
-	Seq       int      `gorm:"not null;index:idx_paragraphs_article,priority:2"`
-	Kind      string   `gorm:"size:16;not null;default:'text'"`
-	Content   string   `gorm:"type:text;not null"`
-	Article   *Article `gorm:"foreignKey:ArticleID;constraint:OnDelete:CASCADE"`
 }
 
 // Dictionary is the ECDICT-derived English→Chinese dictionary.
@@ -101,21 +122,27 @@ func (Dictionary) TableName() string { return "dictionary" }
 
 // WordAnnotation is a user's chosen part-of-speech + sense for one word
 // occurrence. The composite unique key makes the upsert idempotent.
+//
+// The anchor is (article_id, paragraph_hash, sentence_index, word_index).
+// ParagraphHash identifies the paragraph by its content rather than by a row id
+// or a position, so inserting or reordering paragraphs elsewhere in the article
+// leaves this annotation pointing at exactly the same text. Editing the
+// paragraph itself changes its hash, which is how the app can report the
+// annotation as stale instead of silently mis-pointing it.
 type WordAnnotation struct {
-	ID            int64      `gorm:"primaryKey"`
-	UserID        int64      `gorm:"not null;uniqueIndex:uk_word_annotations,priority:1;index:idx_word_annotations_article,priority:1"`
-	ArticleID     int64      `gorm:"not null;uniqueIndex:uk_word_annotations,priority:2;index:idx_word_annotations_article,priority:2"`
-	ParagraphID   int64      `gorm:"not null;uniqueIndex:uk_word_annotations,priority:3"`
-	SentenceIndex int        `gorm:"not null;uniqueIndex:uk_word_annotations,priority:4"`
-	WordIndex     int        `gorm:"not null;uniqueIndex:uk_word_annotations,priority:5"`
-	Word          string     `gorm:"size:128;not null"`
-	Pos           string     `gorm:"size:32;not null;default:''"`
-	Sense         string     `gorm:"size:512;not null;default:''"`
-	CreatedAt     time.Time  `gorm:"not null"`
-	UpdatedAt     time.Time  `gorm:"not null"`
-	User          *User      `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
-	Article       *Article   `gorm:"foreignKey:ArticleID;constraint:OnDelete:CASCADE"`
-	Paragraph     *Paragraph `gorm:"foreignKey:ParagraphID;constraint:OnDelete:CASCADE"`
+	ID            int64     `gorm:"primaryKey"`
+	UserID        int64     `gorm:"not null;uniqueIndex:uk_word_annotations,priority:1;index:idx_word_annotations_article,priority:1"`
+	ArticleID     int64     `gorm:"not null;uniqueIndex:uk_word_annotations,priority:2;index:idx_word_annotations_article,priority:2"`
+	ParagraphHash string    `gorm:"size:64;not null;default:'';uniqueIndex:uk_word_annotations,priority:3"`
+	SentenceIndex int       `gorm:"not null;uniqueIndex:uk_word_annotations,priority:4"`
+	WordIndex     int       `gorm:"not null;uniqueIndex:uk_word_annotations,priority:5"`
+	Word          string    `gorm:"size:128;not null"`
+	Pos           string    `gorm:"size:32;not null;default:''"`
+	Sense         string    `gorm:"size:512;not null;default:''"`
+	CreatedAt     time.Time `gorm:"not null"`
+	UpdatedAt     time.Time `gorm:"not null"`
+	User          *User     `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
+	Article       *Article  `gorm:"foreignKey:ArticleID;constraint:OnDelete:CASCADE"`
 }
 
 // Note is a sentence note (sentence_index >= 0) or a whole-paragraph note
@@ -129,17 +156,16 @@ type WordAnnotation struct {
 // zero value "" happens to equal the default for the remaining string columns,
 // so those are safe.
 type Note struct {
-	ID            int64      `gorm:"primaryKey"`
-	UserID        int64      `gorm:"not null;index:idx_notes_article,priority:1"`
-	ArticleID     int64      `gorm:"not null;index:idx_notes_article,priority:2"`
-	ParagraphID   int64      `gorm:"not null"`
-	SentenceIndex int        `gorm:"not null"`
-	Content       string     `gorm:"type:text;not null"`
-	CreatedAt     time.Time  `gorm:"not null"`
-	UpdatedAt     time.Time  `gorm:"not null"`
-	User          *User      `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
-	Article       *Article   `gorm:"foreignKey:ArticleID;constraint:OnDelete:CASCADE"`
-	Paragraph     *Paragraph `gorm:"foreignKey:ParagraphID;constraint:OnDelete:CASCADE"`
+	ID            int64     `gorm:"primaryKey"`
+	UserID        int64     `gorm:"not null;index:idx_notes_article,priority:1"`
+	ArticleID     int64     `gorm:"not null;index:idx_notes_article,priority:2"`
+	ParagraphHash string    `gorm:"size:64;not null;default:''"`
+	SentenceIndex int       `gorm:"not null"`
+	Content       string    `gorm:"type:text;not null"`
+	CreatedAt     time.Time `gorm:"not null"`
+	UpdatedAt     time.Time `gorm:"not null"`
+	User          *User     `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
+	Article       *Article  `gorm:"foreignKey:ArticleID;constraint:OnDelete:CASCADE"`
 }
 
 // TranslationCache is a global cache keyed by source-text hash, shared by all
@@ -159,18 +185,17 @@ func (TranslationCache) TableName() string { return "translation_cache" }
 // UserTranslation is a user's own saved translation for a sentence or a whole
 // paragraph.
 type UserTranslation struct {
-	ID             int64      `gorm:"primaryKey"`
-	UserID         int64      `gorm:"not null;uniqueIndex:uk_user_translations,priority:1;index:idx_user_translations_article,priority:1"`
-	ArticleID      int64      `gorm:"not null;uniqueIndex:uk_user_translations,priority:2;index:idx_user_translations_article,priority:2"`
-	ParagraphID    int64      `gorm:"not null;uniqueIndex:uk_user_translations,priority:3"`
-	SentenceIndex  int        `gorm:"not null;uniqueIndex:uk_user_translations,priority:4"`
-	SourceText     string     `gorm:"type:text;not null"`
-	TranslatedText string     `gorm:"type:text;not null"`
-	CreatedAt      time.Time  `gorm:"not null"`
-	UpdatedAt      time.Time  `gorm:"not null"`
-	User           *User      `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
-	Article        *Article   `gorm:"foreignKey:ArticleID;constraint:OnDelete:CASCADE"`
-	Paragraph      *Paragraph `gorm:"foreignKey:ParagraphID;constraint:OnDelete:CASCADE"`
+	ID             int64     `gorm:"primaryKey"`
+	UserID         int64     `gorm:"not null;uniqueIndex:uk_user_translations,priority:1;index:idx_user_translations_article,priority:1"`
+	ArticleID      int64     `gorm:"not null;uniqueIndex:uk_user_translations,priority:2;index:idx_user_translations_article,priority:2"`
+	ParagraphHash  string    `gorm:"size:64;not null;default:'';uniqueIndex:uk_user_translations,priority:3"`
+	SentenceIndex  int       `gorm:"not null;uniqueIndex:uk_user_translations,priority:4"`
+	SourceText     string    `gorm:"type:text;not null"`
+	TranslatedText string    `gorm:"type:text;not null"`
+	CreatedAt      time.Time `gorm:"not null"`
+	UpdatedAt      time.Time `gorm:"not null"`
+	User           *User     `gorm:"foreignKey:UserID;constraint:OnDelete:CASCADE"`
+	Article        *Article  `gorm:"foreignKey:ArticleID;constraint:OnDelete:CASCADE"`
 }
 
 // Meta stores small key/value bookkeeping rows (currently the seed versions).
@@ -185,6 +210,10 @@ type Meta struct {
 func (Meta) TableName() string { return "meta" }
 
 // AllModels is the AutoMigrate set, ordered so referenced tables come first.
+//
+// Paragraph is deliberately absent: article bodies live in JSON files under
+// <CONTENT_ROOT>, and annotation anchors use content.paragraph_hash rather than
+// a paragraph row id.
 func AllModels() []any {
 	return []any{
 		&User{},
@@ -192,7 +221,6 @@ func AllModels() []any {
 		&PendingRegistration{},
 		&Dataset{},
 		&Article{},
-		&Paragraph{},
 		&Dictionary{},
 		&WordAnnotation{},
 		&Note{},

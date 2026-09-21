@@ -10,12 +10,17 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"english-reading/backend/internal/content"
 	"english-reading/backend/internal/store"
 )
 
 const (
 	dictVersion = "ecdict-common-2"
-	articlesVer = "articles-4"
+
+	// starterVer labels the sample corpus that ships in the binary. It is
+	// recorded for information only: the starter is materialised *once*, when
+	// the content root is empty, and never overwrites a tree that has content.
+	starterVer = "starter-1"
 
 	// Rows per multi-value INSERT while importing the dictionary. 500 rows ×
 	// 4 columns = 2000 bind variables, comfortably under both SQLite's and
@@ -40,32 +45,55 @@ type dictEntry struct {
 	S []dictSense `json:"s"`
 }
 
-type seedArticle struct {
-	Title      string   `json:"title"`
-	Subtitle   string   `json:"subtitle"`
-	Level      string   `json:"level"`
-	Paragraphs []string `json:"paragraphs"`
-}
-
-type seedDataset struct {
-	Slug        string        `json:"slug"`
-	Title       string        `json:"title"`
-	Description string        `json:"description"`
-	Emoji       string        `json:"emoji"`
-	Color       string        `json:"color"`
-	Articles    []seedArticle `json:"articles"`
-}
-
-// Run seeds the built-in ECDICT-derived dictionary and the starter article
-// dataset when the database is empty. Both are idempotent through meta flags.
+// Run seeds the built-in ECDICT-derived dictionary when the database is empty.
+// It is idempotent through a meta flag.
+//
+// Articles are no longer seeded into the database: article bodies live in JSON
+// files under CONTENT_ROOT and are indexed by scanning that tree. See
+// MaterializeStarter and content.Sync.
 func Run(db *gorm.DB) error {
 	if err := seedDictionary(db); err != nil {
 		return fmt.Errorf("seed dictionary: %w", err)
 	}
-	if err := seedArticles(db); err != nil {
-		return fmt.Errorf("seed articles: %w", err)
-	}
 	return nil
+}
+
+// StarterAvailable reports whether an embedded starter corpus exists.
+func StarterAvailable() bool { return len(articlesSeedJSON) > 0 }
+
+// MaterializeStarter writes the embedded sample corpus into the content root
+// when — and only when — that root holds no articles yet.
+//
+// This is what keeps a fresh clone usable: the reader has something to show
+// before anyone imports their own text. Once the tree has content it is never
+// touched again, because the tree is the source of truth.
+func MaterializeStarter(db *gorm.DB, cs *content.Store) error {
+	if !StarterAvailable() {
+		return nil
+	}
+	has, err := cs.HasArticles()
+	if err != nil {
+		return err
+	}
+	if has {
+		return nil
+	}
+
+	datasets, err := content.LoadCorpus(articlesSeedJSON)
+	if err != nil {
+		return fmt.Errorf("parse starter corpus: %w", err)
+	}
+	res, err := cs.MaterializeCorpus(datasets, content.MaterializeOptions{})
+	if err != nil {
+		return fmt.Errorf("materialise starter corpus: %w", err)
+	}
+	if res.Written == 0 {
+		return nil
+	}
+	log.Printf("[seed] starter corpus written to %s: %d dataset(s), %d article(s)",
+		cs.Root(), res.Datasets, res.Written)
+
+	return markSeeded(db, "starter_version", starterVer)
 }
 
 func seeded(db *gorm.DB, key, version string) (bool, error) {
@@ -145,79 +173,5 @@ func seedDictionary(db *gorm.DB) error {
 		return err
 	}
 	log.Printf("[seed] dictionary ready in %s", time.Since(start).Round(time.Millisecond))
-	return nil
-}
-
-func seedArticles(db *gorm.DB) error {
-	ok, err := seeded(db, "articles_version", articlesVer)
-	if err != nil || ok {
-		return err
-	}
-
-	var datasets []seedDataset
-	if err := json.Unmarshal(articlesSeedJSON, &datasets); err != nil {
-		return fmt.Errorf("parse article seed: %w", err)
-	}
-
-	err = db.Transaction(func(tx *gorm.DB) error {
-		// Seed content is versioned and read-only from the app's perspective;
-		// clear the previous seed before importing the new one. The foreign
-		// keys cascade into paragraphs and the annotations anchored to them.
-		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&store.Article{}).Error; err != nil {
-			return err
-		}
-		if err := tx.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&store.Dataset{}).Error; err != nil {
-			return err
-		}
-
-		for _, ds := range datasets {
-			dataset := store.Dataset{
-				Slug:        ds.Slug,
-				Title:       ds.Title,
-				Description: ds.Description,
-				Emoji:       ds.Emoji,
-				Color:       ds.Color,
-			}
-			if err := tx.Create(&dataset).Error; err != nil {
-				return fmt.Errorf("insert dataset %s: %w", ds.Slug, err)
-			}
-
-			for _, art := range ds.Articles {
-				article := store.Article{
-					DatasetID: dataset.ID,
-					Title:     art.Title,
-					Subtitle:  art.Subtitle,
-					Level:     art.Level,
-				}
-				if err := tx.Create(&article).Error; err != nil {
-					return fmt.Errorf("insert article %q: %w", art.Title, err)
-				}
-
-				// The article title is also stored as a heading paragraph so
-				// the reader has a stable, scrollable TOC anchor.
-				paragraphs := []store.Paragraph{
-					{ArticleID: article.ID, Seq: 0, Kind: "heading", Content: art.Title},
-				}
-				seq := 1
-				for _, p := range art.Paragraphs {
-					if p == "" {
-						continue
-					}
-					paragraphs = append(paragraphs, store.Paragraph{
-						ArticleID: article.ID, Seq: seq, Kind: "text", Content: p,
-					})
-					seq++
-				}
-				if err := tx.Create(&paragraphs).Error; err != nil {
-					return fmt.Errorf("insert paragraphs for %q: %w", art.Title, err)
-				}
-			}
-		}
-		return markSeeded(tx, "articles_version", articlesVer)
-	})
-	if err != nil {
-		return err
-	}
-	log.Printf("[seed] article datasets ready")
 	return nil
 }

@@ -38,7 +38,7 @@ func TestMigrationTableNames(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, db *gorm.DB) {
 		want := []string{
 			"users", "sessions", "pending_registrations", "datasets", "articles",
-			"paragraphs", "dictionary", "word_annotations", "notes",
+			"dictionary", "word_annotations", "notes",
 			"translation_cache", "meta", "user_translations",
 		}
 		for _, name := range want {
@@ -46,37 +46,44 @@ func TestMigrationTableNames(t *testing.T) {
 				t.Errorf("table %q was not created", name)
 			}
 		}
-		for _, bad := range []string{"dictionaries", "translation_caches", "metas"} {
+		for _, bad := range []string{"dictionaries", "translation_caches", "metas", "paragraphs"} {
 			if db.Migrator().HasTable(bad) {
-				t.Errorf("unexpected pluralised table %q exists", bad)
+				t.Errorf("unexpected table %q exists", bad)
 			}
 		}
 	})
 }
 
-// Foreign keys must exist so that re-seeding articles cascades.
+// Foreign keys must exist so that deleting an article takes its anchors with
+// it (and deleting a dataset takes its articles).
 func TestMigrationForeignKeysCascade(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, db *gorm.DB) {
-		ds := Dataset{Slug: "aesop", Title: "伊索寓言"}
+		u := User{Email: "cascade@e.x", Nickname: "c", PasswordHash: "h", CreatedAt: time.Now().UTC()}
+		ds := Dataset{Slug: "cascade", Title: "t", Dir: "cascade"}
+		if err := db.Create(&u).Error; err != nil {
+			t.Fatalf("create user: %v", err)
+		}
 		if err := db.Create(&ds).Error; err != nil {
 			t.Fatalf("create dataset: %v", err)
 		}
-		art := Article{DatasetID: ds.ID, Title: "The Fox", Level: "A1"}
+		art := newTestArticle(ds.ID, "The Fox")
 		if err := db.Create(&art).Error; err != nil {
 			t.Fatalf("create article: %v", err)
 		}
-		par := Paragraph{ArticleID: art.ID, Seq: 0, Kind: "text", Content: "hello"}
-		if err := db.Create(&par).Error; err != nil {
-			t.Fatalf("create paragraph: %v", err)
+		if err := db.Create(&WordAnnotation{
+			UserID: u.ID, ArticleID: art.ID, ParagraphHash: TestHash,
+			SentenceIndex: 0, WordIndex: 0, Word: "fox", Sense: "狐狸",
+		}).Error; err != nil {
+			t.Fatalf("create annotation: %v", err)
 		}
 
 		if err := db.Where("id = ?", art.ID).Delete(&Article{}).Error; err != nil {
 			t.Fatalf("delete article: %v", err)
 		}
 		var count int64
-		db.Model(&Paragraph{}).Where("article_id = ?", art.ID).Count(&count)
+		db.Model(&WordAnnotation{}).Where("article_id = ?", art.ID).Count(&count)
 		if count != 0 {
-			t.Errorf("paragraphs not cascaded: %d rows remain", count)
+			t.Errorf("word annotations not cascaded: %d rows remain", count)
 		}
 	})
 }
@@ -116,29 +123,25 @@ func TestUpsertReturningIDIsStableOnRepeat(t *testing.T) {
 		if err := db.Create(&ds).Error; err != nil {
 			t.Fatalf("create dataset: %v", err)
 		}
-		art := Article{DatasetID: ds.ID, Title: "a"}
+		art := newTestArticle(ds.ID, "a")
 		if err := db.Create(&art).Error; err != nil {
 			t.Fatalf("create article: %v", err)
-		}
-		par := Paragraph{ArticleID: art.ID, Seq: 0, Kind: "text", Content: "x"}
-		if err := db.Create(&par).Error; err != nil {
-			t.Fatalf("create paragraph: %v", err)
 		}
 
 		upsert := func(sense string) int64 {
 			t.Helper()
 			row := WordAnnotation{
-				UserID: u.ID, ArticleID: art.ID, ParagraphID: par.ID,
+				UserID: u.ID, ArticleID: art.ID, ParagraphHash: TestHash,
 				SentenceIndex: 0, WordIndex: 4, Word: "apple", Pos: "n.", Sense: sense,
 			}
 			id, err := UpsertReturningID(db, &row, clause.OnConflict{
 				Columns: []clause.Column{
-					{Name: "user_id"}, {Name: "article_id"}, {Name: "paragraph_id"},
+					{Name: "user_id"}, {Name: "article_id"}, {Name: "paragraph_hash"},
 					{Name: "sentence_index"}, {Name: "word_index"},
 				},
 				DoUpdates: clause.AssignmentColumns([]string{"word", "pos", "sense", "updated_at"}),
-			}, "user_id = ? AND article_id = ? AND paragraph_id = ? AND sentence_index = ? AND word_index = ?",
-				[]any{u.ID, art.ID, par.ID, 0, 4})
+			}, "user_id = ? AND article_id = ? AND paragraph_hash = ? AND sentence_index = ? AND word_index = ?",
+				[]any{u.ID, art.ID, TestHash, 0, 4})
 			if err != nil {
 				t.Fatalf("upsert(%q): %v", sense, err)
 			}
@@ -257,16 +260,12 @@ func TestZeroValuedSentenceIndexIsPersisted(t *testing.T) {
 		if err := db.Create(&ds).Error; err != nil {
 			t.Fatalf("create dataset: %v", err)
 		}
-		art := Article{DatasetID: ds.ID, Title: "a"}
+		art := newTestArticle(ds.ID, "a")
 		if err := db.Create(&art).Error; err != nil {
 			t.Fatalf("create article: %v", err)
 		}
-		par := Paragraph{ArticleID: art.ID, Seq: 0, Kind: "text", Content: "x"}
-		if err := db.Create(&par).Error; err != nil {
-			t.Fatalf("create paragraph: %v", err)
-		}
 
-		note := Note{UserID: u.ID, ArticleID: art.ID, ParagraphID: par.ID,
+		note := Note{UserID: u.ID, ArticleID: art.ID, ParagraphHash: TestHash,
 			SentenceIndex: 0, Content: "sentence note"}
 		if err := db.Create(&note).Error; err != nil {
 			t.Fatalf("create note: %v", err)
@@ -279,7 +278,7 @@ func TestZeroValuedSentenceIndexIsPersisted(t *testing.T) {
 			t.Errorf("note sentence_index = %d, want 0", gotNote.SentenceIndex)
 		}
 
-		tr := UserTranslation{UserID: u.ID, ArticleID: art.ID, ParagraphID: par.ID,
+		tr := UserTranslation{UserID: u.ID, ArticleID: art.ID, ParagraphHash: TestHash,
 			SentenceIndex: 0, SourceText: "x", TranslatedText: "y"}
 		if err := db.Create(&tr).Error; err != nil {
 			t.Fatalf("create translation: %v", err)
@@ -292,4 +291,23 @@ func TestZeroValuedSentenceIndexIsPersisted(t *testing.T) {
 			t.Errorf("translation sentence_index = %d, want 0", gotTr.SentenceIndex)
 		}
 	})
+}
+
+// TestHash is a fixed paragraph hash for tests that only need a well-formed
+// anchor value. A real hash comes from anchor.ParagraphHash(text).
+const TestHash = "00000000000000000000000000000000000000000000000000000000000000ff"
+
+// newTestArticle builds an Article that satisfies the index columns the content
+// sync normally fills in. Every article row needs a unique RelPath because the
+// column is UNIQUE.
+func newTestArticle(datasetID int64, title string) Article {
+	rel := "test/" + title + ".json"
+	return Article{
+		DatasetID:      datasetID,
+		Title:          title,
+		RelPath:        rel,
+		ContentHash:    "hash-" + title,
+		ParagraphCount: 1,
+		SentenceCount:  1,
+	}
 }

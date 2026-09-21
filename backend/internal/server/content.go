@@ -6,9 +6,11 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"gorm.io/gorm"
 
+	"english-reading/backend/internal/content"
 	"english-reading/backend/internal/sentence"
 	"english-reading/backend/internal/store"
 )
@@ -33,6 +35,15 @@ type articleDTO struct {
 	Title     string `json:"title"`
 	Subtitle  string `json:"subtitle"`
 	Level     string `json:"level"`
+	Author    string `json:"author"`
+	Origin    string `json:"origin"`
+	// PublishedAt is RFC3339 or null; the reader shows it when present.
+	PublishedAt *string `json:"publishedAt"`
+	// ParagraphCount and SentenceCount are columns denormalised at sync time,
+	// so listing articles never opens a file or runs a COUNT.
+	ParagraphCount int  `json:"paragraphCount"`
+	SentenceCount  int  `json:"sentenceCount"`
+	ContentChanged bool `json:"contentChanged,omitempty"`
 }
 
 type sentenceDTO struct {
@@ -40,20 +51,42 @@ type sentenceDTO struct {
 	Text  string `json:"text"`
 }
 
+// paragraphDTO is one rendered block of an article.
+//
+// Hash replaces the old paragraph row id and is the annotation anchor: it is
+// derived from the paragraph text, so it survives inserting or reordering other
+// paragraphs and changes exactly when this paragraph's text changes.
 type paragraphDTO struct {
-	ID        int64         `json:"id"`
-	Seq       int           `json:"seq"`
+	Hash      string        `json:"hash"`
+	Index     int           `json:"index"`
 	Kind      string        `json:"kind"`
 	Content   string        `json:"content"`
 	Sentences []sentenceDTO `json:"sentences"`
 }
 
+// articleDetail is what GET /api/articles/{id} returns.
+type articleDetail struct {
+	Article      articleDTO     `json:"article"`
+	Dataset      datasetDTO     `json:"dataset"`
+	Paragraphs   []paragraphDTO `json:"paragraphs"`
+	PrevArticle  *int64         `json:"prevArticleId"`
+	NextArticle  *int64         `json:"nextArticleId"`
+	ParagraphCnt int            `json:"paragraphCount"`
+	// StaleAnchors counts this user's annotations whose paragraph hash is no
+	// longer present in the file, i.e. the text under them was edited. They are
+	// reported, never deleted.
+	StaleAnchors int `json:"staleAnchors"`
+}
+
 func (s *Server) handleDatasets(w http.ResponseWriter, r *http.Request) {
+	// The count runs once per dataset, and skips articles whose file is gone so
+	// a deleted file stops being advertised.
 	var rows []datasetDTO
 	err := s.db.Model(&store.Dataset{}).
 		Select(`datasets.id, datasets.slug, datasets.title, datasets.description,
 		        datasets.emoji, datasets.color,
-		        (SELECT COUNT(*) FROM articles a WHERE a.dataset_id = datasets.id) AS article_count`).
+		        (SELECT COUNT(*) FROM articles a
+		          WHERE a.dataset_id = datasets.id AND a.missing = ?) AS article_count`, false).
 		Order("datasets.id").
 		Scan(&rows).Error
 	if err != nil {
@@ -68,13 +101,21 @@ func (s *Server) handleDatasets(w http.ResponseWriter, r *http.Request) {
 }
 
 // datasetArticlesRow is the flattened projection for the article list.
+//
+// There is no paragraph subquery any more: paragraph_count and sentence_count
+// are columns maintained by content.Sync, which is what makes listing a dataset
+// with tens of thousands of articles cheap.
 type datasetArticlesRow struct {
-	ID             int64  `gorm:"column:id"`
-	DatasetID      int64  `gorm:"column:dataset_id"`
-	Title          string `gorm:"column:title"`
-	Subtitle       string `gorm:"column:subtitle"`
-	Level          string `gorm:"column:level"`
-	ParagraphCount int64  `gorm:"column:paragraph_count"`
+	ID             int64   `gorm:"column:id"`
+	DatasetID      int64   `gorm:"column:dataset_id"`
+	Title          string  `gorm:"column:title"`
+	Subtitle       string  `gorm:"column:subtitle"`
+	Level          string  `gorm:"column:level"`
+	Author         string  `gorm:"column:author"`
+	Origin         string  `gorm:"column:origin"`
+	PublishedAt    *string `gorm:"column:published_at"`
+	ParagraphCount int     `gorm:"column:paragraph_count"`
+	SentenceCount  int     `gorm:"column:sentence_count"`
 }
 
 func (s *Server) handleDatasetArticles(w http.ResponseWriter, r *http.Request) {
@@ -98,9 +139,10 @@ func (s *Server) handleDatasetArticles(w http.ResponseWriter, r *http.Request) {
 
 	var rows []datasetArticlesRow
 	err = s.db.Model(&store.Article{}).
-		Select(`articles.id, articles.dataset_id, articles.title, articles.subtitle, articles.level,
-		        (SELECT COUNT(*) FROM paragraphs p WHERE p.article_id = articles.id AND p.kind = 'text') AS paragraph_count`).
-		Where("articles.dataset_id = ?", id).
+		Select(`articles.id, articles.dataset_id, articles.title, articles.subtitle,
+		        articles.level, articles.author, articles.origin,
+		        articles.published_at, articles.paragraph_count, articles.sentence_count`).
+		Where("articles.dataset_id = ? AND articles.missing = ?", id, false).
 		Order("articles.id").
 		Scan(&rows).Error
 	if err != nil {
@@ -113,8 +155,9 @@ func (s *Server) handleDatasetArticles(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		articles = append(articles, map[string]any{
 			"id": row.ID, "datasetId": row.DatasetID, "title": row.Title,
-			"subtitle": row.Subtitle, "level": row.Level,
-			"paragraphCount": row.ParagraphCount,
+			"subtitle": row.Subtitle, "level": row.Level, "author": row.Author,
+			"origin": row.Origin, "publishedAt": row.PublishedAt,
+			"paragraphCount": row.ParagraphCount, "sentenceCount": row.SentenceCount,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -152,49 +195,89 @@ func (s *Server) handleArticleDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var paras []store.Paragraph
-	if err := s.db.Where("article_id = ?", articleID).
-		Order("seq").Find(&paras).Error; err != nil {
-		log.Printf("load paragraphs: %v", err)
-		writeError(w, http.StatusInternalServerError, "读取段落失败")
+	loaded, err := s.content.LoadArticle(art.RelPath)
+	if err != nil {
+		// A missing or unreadable file is a content problem, not a server bug:
+		// say which file instead of returning an unexplained 500.
+		log.Printf("load article content %s: %v", art.RelPath, err)
+		writeError(w, http.StatusNotFound, "文章正文文件缺失或损坏："+art.RelPath)
 		return
 	}
 
-	paragraphs := make([]paragraphDTO, 0, len(paras))
-	for _, p := range paras {
-		dto := paragraphDTO{
-			ID: p.ID, Seq: p.Seq, Kind: p.Kind, Content: p.Content,
-			Sentences: make([]sentenceDTO, 0),
+	paragraphs := make([]paragraphDTO, 0, loaded.ParagraphCount+1)
+	// The title is rendered as a heading block so the reader keeps a scroll
+	// anchor for it, exactly like the old heading paragraph did.
+	paragraphs = append(paragraphs, paragraphDTO{
+		Hash: content.ParagraphHash(loaded.Title), Index: 0, Kind: "heading",
+		Content: loaded.Title, Sentences: []sentenceDTO{},
+	})
+	for i, text := range loaded.Paragraphs {
+		sentences := make([]sentenceDTO, 0, loaded.SentenceCounts[i])
+		for j, stext := range sentence.Split(text) {
+			sentences = append(sentences, sentenceDTO{Index: j, Text: stext})
 		}
-		if p.Kind == "text" {
-			for i, text := range sentence.Split(p.Content) {
-				dto.Sentences = append(dto.Sentences, sentenceDTO{Index: i, Text: text})
-			}
-		}
-		paragraphs = append(paragraphs, dto)
+		paragraphs = append(paragraphs, paragraphDTO{
+			Hash: loaded.ParagraphHashes[i], Index: i + 1, Kind: "text",
+			Content: text, Sentences: sentences,
+		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
-		"article": articleDTO{
-			ID: art.ID, DatasetID: art.DatasetID, Title: art.Title,
-			Subtitle: art.Subtitle, Level: art.Level,
+	writeJSON(w, http.StatusOK, articleDetail{
+		Article: articleDTO{
+			ID: art.ID, DatasetID: art.DatasetID, Title: loaded.Title,
+			Subtitle: loaded.Subtitle, Level: loaded.Level, Author: loaded.Author,
+			Origin: loaded.Origin, PublishedAt: formatTimePtr(loaded.PublishedAt),
+			ParagraphCount: loaded.ParagraphCount, SentenceCount: loaded.SentenceCount,
+			ContentChanged: art.ContentHash != loaded.ContentHash,
 		},
-		"dataset": datasetDTO{
+		Dataset: datasetDTO{
 			ID: ds.ID, Slug: ds.Slug, Title: ds.Title, Description: ds.Description,
 			Emoji: ds.Emoji, Color: ds.Color,
 		},
-		"paragraphs":        paragraphs,
-		"prevArticleId":     neighbourArticleID(s.db, art.DatasetID, articleID, true),
-		"nextArticleId":     neighbourArticleID(s.db, art.DatasetID, articleID, false),
-		"paragraphCount":    len(paragraphs),
-		"sentenceSplitInfo": "句子由后端按英文标点规则切分，标注键为 paragraph_id + sentence_index + word_index",
+		Paragraphs:   paragraphs,
+		PrevArticle:  neighbourArticleID(s.db, art.DatasetID, articleID, true),
+		NextArticle:  neighbourArticleID(s.db, art.DatasetID, articleID, false),
+		ParagraphCnt: len(paragraphs),
+		StaleAnchors: s.staleAnchorCount(r, art.ID, loaded),
 	})
+}
+
+// staleAnchorCount reports how many of the viewer's annotation anchors no
+// longer resolve to a paragraph in the file. Informational only: a stale anchor
+// means the text under it was edited, not that anything was lost.
+func (s *Server) staleAnchorCount(r *http.Request, articleID int64, loaded *content.Article) int {
+	user, err := s.authenticate(r)
+	if err != nil {
+		return 0
+	}
+	var hashes []string
+	if err := s.db.Model(&store.WordAnnotation{}).
+		Where("user_id = ? AND article_id = ?", user.ID, articleID).
+		Distinct().Pluck("paragraph_hash", &hashes).Error; err != nil {
+		return 0
+	}
+	stale := 0
+	for _, h := range hashes {
+		if _, ok := loaded.ParagraphByHash(h); !ok {
+			stale++
+		}
+	}
+	return stale
+}
+
+func formatTimePtr(t *time.Time) *string {
+	if t == nil {
+		return nil
+	}
+	s := t.UTC().Format(time.RFC3339)
+	return &s
 }
 
 // neighbourArticleID returns the id of the previous (before=true) or next
 // article within the same dataset, or nil when there is none.
 func neighbourArticleID(db *gorm.DB, datasetID, articleID int64, before bool) *int64 {
-	query := db.Model(&store.Article{}).Where("dataset_id = ?", datasetID)
+	query := db.Model(&store.Article{}).
+		Where("dataset_id = ? AND missing = ?", datasetID, false)
 	if before {
 		query = query.Where("id < ?", articleID).Order("id DESC")
 	} else {
@@ -207,6 +290,12 @@ func neighbourArticleID(db *gorm.DB, datasetID, articleID int64, before bool) *i
 	}
 	id := found[0]
 	return &id
+}
+
+// dictSenseDTO is one dictionary sense shown in the word popup.
+type dictSenseDTO struct {
+	Pos string `json:"pos"`
+	Def string `json:"def"`
 }
 
 func (s *Server) handleDictLookup(w http.ResponseWriter, r *http.Request) {
@@ -281,9 +370,4 @@ func (s *Server) handleDictLookup(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"word": string(entry.Word), "phonetic": entry.Phonetic, "found": true, "senses": senses,
 	})
-}
-
-type dictSenseDTO struct {
-	Pos string `json:"pos"`
-	Def string `json:"def"`
 }
