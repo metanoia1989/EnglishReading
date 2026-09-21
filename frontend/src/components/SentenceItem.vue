@@ -1,5 +1,6 @@
 <script setup>
 import { computed } from 'vue'
+import InlineNoteEditor from './InlineNoteEditor.vue'
 
 const props = defineProps({
   sentence: { type: Object, required: true },
@@ -8,6 +9,9 @@ const props = defineProps({
   notes: { type: Array, default: () => [] },
   busy: { type: Boolean, default: false },
   showActions: { type: Boolean, default: true },
+  // 句子批注就地展开，由父组件决定开的是不是这一句
+  noteOpen: { type: Boolean, default: false },
+  noteSaving: { type: Boolean, default: false },
 })
 
 const emit = defineEmits([
@@ -17,6 +21,8 @@ const emit = defineEmits([
   'delete-word',
   'delete-translation',
   'delete-note',
+  'note-save',
+  'note-cancel',
 ])
 
 const segments = computed(() => tokenize(props.sentence.text))
@@ -96,13 +102,22 @@ function onWordClick(seg, event) {
     <!-- 第 2 行：选中的词性 + 词义，颜色更浅 -->
     <div v-if="picks.length" class="line word-picks">
       <span class="line-tag">词</span>
-      <span v-for="a in picks" :key="a.id" class="pick-chip">
+      <span v-for="a in picks" :key="a.id" class="pick-chip" :title="pickLabel(a)">
         <b>{{ a.word }}</b>
-        <span v-if="a.pos"> {{ a.pos }}</span>
+        <span v-if="a.pos" class="pick-pos">{{ a.pos }}</span>
         <span class="pick-sense">{{ a.sense }}</span>
         <button class="chip-close" title="取消这个单词的标注" @click="emit('delete-word', a)">×</button>
       </span>
     </div>
+
+    <!-- 句子批注：就在这一句的词义之后就地展开，融入段落 -->
+    <InlineNoteEditor
+      :open="noteOpen"
+      :saving="noteSaving"
+      placeholder="写这一句的理解、语法点或疑问…"
+      @save="(text) => emit('note-save', text)"
+      @cancel="emit('note-cancel')"
+    />
 
     <!-- 第 3 行：翻译 -->
     <div v-if="translation" class="line translation-line">
@@ -226,6 +241,9 @@ function onWordClick(seg, event) {
 .word-picks {
   background: rgba(139, 92, 246, 0.045);
   color: #9d8ac4;
+  /* 每条词义自身不折行，条数多了整条换到下一行 */
+  flex-wrap: wrap;
+  row-gap: 4px;
 }
 
 .word-picks .line-tag {
@@ -239,6 +257,9 @@ function onWordClick(seg, event) {
   gap: 4px;
   margin-right: 10px;
   color: #9d8ac4;
+  min-width: 0;
+  max-width: 100%;
+  white-space: nowrap;
 }
 
 .pick-chip b {
@@ -247,6 +268,8 @@ function onWordClick(seg, event) {
 
 .pick-sense {
   color: #a79ac9;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .translation-line {

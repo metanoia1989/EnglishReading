@@ -5,7 +5,7 @@ import { contentApi } from '../api'
 import { auth } from '../store/auth'
 import SentenceItem from '../components/SentenceItem.vue'
 import WordPopup from '../components/WordPopup.vue'
-import NoteModal from '../components/NoteModal.vue'
+import InlineNoteEditor from '../components/InlineNoteEditor.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -380,13 +380,42 @@ async function removeTranslation(translation) {
 
 // ---------- notes ----------
 
+// 批注不再是弹窗：在句子/段落内部就地展开一个输入表单，提交或取消后收起。
+// 同一个位置再次点击「批」则收起（切换）。
 function openNote(paragraph, sentence = null) {
   if (!requireLogin()) return
+  const sentenceIndex = sentence ? sentence.index : -1
+  const same =
+    noteEditor.open &&
+    noteEditor.paragraphHash === paragraph.hash &&
+    noteEditor.sentenceIndex === sentenceIndex
+  if (same) {
+    closeNote()
+    return
+  }
   noteEditor.paragraphHash = paragraph.hash
-  noteEditor.sentenceIndex = sentence ? sentence.index : -1
-  noteEditor.title = sentence ? `句子批注 · ${paragraph.index}-${sentence.index + 1}` : `段落批注 · 第 ${paragraph.index} 段`
+  noteEditor.sentenceIndex = sentenceIndex
+  noteEditor.title = sentence
+    ? `句子批注 · ${paragraph.index}-${sentence.index + 1}`
+    : `段落批注 · 第 ${paragraph.index} 段`
   noteEditor.open = true
 }
+
+function closeNote() {
+  noteEditor.open = false
+  noteEditor.paragraphHash = null
+  noteEditor.sentenceIndex = -1
+}
+
+function noteOpenFor(paragraphHash, sentenceIndex) {
+  return (
+    noteEditor.open &&
+    noteEditor.paragraphHash === paragraphHash &&
+    noteEditor.sentenceIndex === sentenceIndex
+  )
+}
+
+const paragraphNoteOpen = (paragraphHash) => noteOpenFor(paragraphHash, -1)
 
 async function saveNote(content) {
   noteEditor.saving = true
@@ -397,7 +426,7 @@ async function saveNote(content) {
       content,
     })
     notes.value = [...notes.value, saved]
-    noteEditor.open = false
+    closeNote()
     showToast('批注已保存')
   } catch (e) {
     showToast(e.message)
@@ -539,12 +568,16 @@ const nextArticle = computed(() =>
                 :translation="translationFor(p.hash, s.index)"
                 :notes="notesFor(p.hash, s.index)"
                 :busy="isBusy(`${p.hash}:${s.index}`)"
+                :note-open="noteOpenFor(p.hash, s.index)"
+                :note-saving="noteEditor.saving"
                 @word-click="(token, ev) => onWordClick(p, token, ev)"
                 @translate="translateSentence(p, s)"
                 @annotate="openNote(p, s)"
                 @delete-word="removeWordAnnotation"
                 @delete-translation="removeTranslation"
                 @delete-note="removeNote"
+                @note-save="saveNote"
+                @note-cancel="closeNote"
               />
 
               <!-- 段落级翻译 / 批注：放在整段下方，与句子级区分样式 -->
@@ -566,6 +599,15 @@ const nextArticle = computed(() =>
                 </button>
                 <button class="btn btn-ghost para-btn" @click="openNote(p)">段落批注</button>
               </div>
+
+              <!-- 段落批注同样就地展开 -->
+              <InlineNoteEditor
+                :open="paragraphNoteOpen(p.hash)"
+                :saving="noteEditor.saving"
+                placeholder="写这一整段的理解、结构或疑问…"
+                @save="saveNote"
+                @cancel="closeNote"
+              />
             </div>
           </section>
         </article>
@@ -602,14 +644,6 @@ const nextArticle = computed(() =>
       @choose="chooseSense"
       @close="closePopup"
       @remove="removeWordAnnotation"
-    />
-
-    <NoteModal
-      :open="noteEditor.open"
-      :title="noteEditor.title"
-      :saving="noteEditor.saving"
-      @close="noteEditor.open = false"
-      @save="saveNote"
     />
 
     <Transition name="toast">

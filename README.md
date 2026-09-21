@@ -63,7 +63,7 @@ backend/
 frontend/
   src/
     views/                     # 首页 / 文章列表 / 登录注册 / 阅读器
-    components/                # 句子渲染、词典弹窗、批注弹窗
+    components/                # 句子渲染、词典弹窗、就地批注编辑器
 tools/
   txt2articles.py              # raw txt → 合规语料 JSON 的清洗器
 data/content/                  # 正文内容树（开发时实际是 backend/data/content）

@@ -22,22 +22,63 @@ const style = computed(() => {
   }
 })
 
+// ECDICT packs several senses into one definition, one per line, and the extra
+// lines carry their own part-of-speech or domain tag:
+//
+//   n.  狐狸, 狡猾的人
+//       vi. 奸狡地行动, (书页)生斑, 变酸
+//       [医] 表皮脱落
+//
+// Showing that as one block made the whole block selectable at once. Splitting
+// it here means each row is exactly one sense — one part of speech, one line of
+// meaning — which is also what gets stored on the annotation.
+const LEADING_TAG = /^(?:([a-z]{1,6}\.)|(\[[^\]]{1,8}\]))\s*/i
+
+function expandSense(sense) {
+  const out = []
+  String(sense.def ?? '')
+    .split('\n')
+    .forEach((raw, i) => {
+      const line = raw.trim()
+      if (!line) return
+      let pos = ''
+      let def = line
+      const m = line.match(LEADING_TAG)
+      if (m) {
+        const rest = line.slice(m[0].length).trim()
+        // A line that is nothing but a tag keeps the tag as its text.
+        if (rest) {
+          pos = (m[1] || m[2]).trim()
+          def = rest
+        }
+      }
+      // The first line's part of speech is the sense's own pos field.
+      if (i === 0 && sense.pos) pos = sense.pos
+      out.push({ pos, def })
+    })
+  return out
+}
+
 const groups = computed(() => {
   const seen = new Set()
-  return (props.popup.senses || []).filter((s) => {
-    const key = (s.pos || '') + '\u0000' + s.def
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
+  const out = []
+  for (const sense of props.popup.senses || []) {
+    for (const item of expandSense(sense)) {
+      const key = item.pos + '\u0000' + item.def
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(item)
+    }
+  }
+  return out
 })
 
 function isSelected(sense) {
-  return (
-    props.existing &&
-    props.existing.pos === (sense.pos || '') &&
-    props.existing.sense === sense.def
-  )
+  if (!props.existing) return false
+  if (props.existing.pos !== (sense.pos || '')) return false
+  if (props.existing.sense === sense.def) return true
+  // Tolerate rows saved before the definitions were split per line.
+  return String(props.existing.sense || '').split('\n')[0].trim() === sense.def
 }
 </script>
 
@@ -73,7 +114,7 @@ function isSelected(sense) {
           :class="{ selected: isSelected(sense) }"
           @click="emit('choose', { pos: sense.pos || '', def: sense.def })"
         >
-          <span v-if="sense.pos" class="pos">{{ sense.pos }}</span>
+          <span class="pos">{{ sense.pos || '' }}</span>
           <span class="def">{{ sense.def }}</span>
         </button>
       </div>
@@ -182,7 +223,7 @@ function isSelected(sense) {
 
 .pos {
   flex-shrink: 0;
-  min-width: 34px;
+  min-width: 40px;
   font-size: 12px;
   font-weight: 700;
   color: #6b7280;
@@ -194,7 +235,9 @@ function isSelected(sense) {
 
 .def {
   flex: 1;
-  white-space: pre-line;
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .pop-foot {

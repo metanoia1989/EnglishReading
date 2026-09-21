@@ -115,7 +115,7 @@ backend/
     translate/                   # MyMemory 翻译封装
 frontend/
   src/views/                     # HomeView / DatasetView / ReaderView / Login / Register
-  src/components/                # 句子渲染、词典弹窗、批注弹窗
+  src/components/                # 句子渲染、词典弹窗、就地批注编辑器
   vite.config.*                  # dev 代理 /api → 8080
 docs/
   gorm-migration-plan.md         # GORM 改造规划 + 实施结果（含验证数据）
@@ -352,9 +352,18 @@ TEST_MYSQL_DSN='user:pass@tcp(host:3306)/db' go test -p 1 ./...   # SQLite + MyS
 ### 7.2 重新部署
 
 ```bash
-# 1) 前端
+# 1) 前端（**不要直接 rsync 到 webroot**：目录属主是 www，metanoia 建不了临时文件，
+#    会以 "mkstemp ... Permission denied" 半途失败，index.html 与 assets 可能不同步）
 cd frontend && npm run build
-rsync -av --delete dist/ metanoia@192.168.10.10:/www/wwwroot/reading.metanoia.internal/
+tar czf - -C dist . | ssh metanoia@192.168.10.10 'rm -rf /tmp/dist-new && mkdir -p /tmp/dist-new && tar xzf - -C /tmp/dist-new'
+ssh metanoia@192.168.10.10 '
+  W=/www/wwwroot/reading.metanoia.internal
+  sudo rm -rf $W/assets && sudo cp -r /tmp/dist-new/. $W/ && rm -rf /tmp/dist-new
+  sudo chown -R www:www $W 2>/dev/null || true
+'
+# `chown -R` 会对 .user.ini 报 "Operation not permitted" —— 那是宝塔的防篡改文件
+# （lsattr 显示 immutable 属性 i，root 所有），故意留着，`|| true` 忽略即可。
+# 判断部署是否成功：index.html 里引用的 assets 哈希必须都在 assets/ 目录里。
 
 # 2) 后端（本地交叉编译 → 上传 → 重启）
 cd ../backend && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o english-reading .
@@ -480,6 +489,18 @@ curl -s "$B/api/dict/lookup?word=The"         # found=true（大小写不敏感�
 ```
 
 ---
+
+### 9.2 阅读器的三条交互约定（改 UI 时别退化）
+
+1. **词义一行一条**。ECDICT 把一个词的多个义项塞进一个 `def`，行内自带词性/领域标签
+   （`vi. …` / `[医] …`）。`WordPopup.vue` 的 `expandSense()` 按行拆成独立可选行，
+   **第一行的词性取 `sense.pos`**，其余行从行首提取标签。这样存进
+   `word_annotations.sense` 的才是单独一条义项，而不是整块。
+2. **选中的词义一条不折行**（`.pick-chip { white-space: nowrap }`），条数多了整条换到下一行
+   （`.word-picks { flex-wrap: wrap }`）。单条超宽时省略号截断，`title` 里给全文。
+3. **批注不再是弹窗**：`InlineNoteEditor.vue` 在句子/段落内部就地展开（高度从 0 动画到内容高度，
+   提交或取消后收起），句子批注落在**词义之后、下一句之前**，段落批注落在段尾按钮之下。
+   `NoteModal.vue` 已删除，不要把它加回来。
 
 ## 10. 导入自己的语料（大批量 txt）
 
