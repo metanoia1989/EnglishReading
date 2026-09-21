@@ -271,6 +271,13 @@ func (s *Server) handleDictLookup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "词典数据损坏")
 		return
 	}
+	// Rows imported before the seeder learned to convert ECDICT's literal "\n"
+	// still carry the escape; normalise on read so existing databases (local
+	// SQLite and the deployed MySQL one) need no re-seed. See
+	// store.NormalizeDictText. Idempotent, so already-clean rows are untouched.
+	for i := range senses {
+		senses[i].Def = store.NormalizeDictText(senses[i].Def)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"word": string(entry.Word), "phonetic": entry.Phonetic, "found": true, "senses": senses,
 	})

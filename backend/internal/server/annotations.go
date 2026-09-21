@@ -69,7 +69,12 @@ func (s *Server) handleArticleState(w http.ResponseWriter, r *http.Request, user
 		words = append(words, wordAnnotationDTO{
 			ID: a.ID, ArticleID: a.ArticleID, ParagraphID: a.ParagraphID,
 			SentenceIndex: a.SentenceIndex, WordIndex: a.WordIndex,
-			Word: a.Word, Pos: a.Pos, Sense: a.Sense,
+			Word: a.Word, Pos: a.Pos,
+			// Annotations saved before the escape handling landed stored
+			// ECDICT's literal "\n"; clean it here too so the chip under the
+			// word, the popup footer and the `selected` match against the
+			// dictionary's now-normalised definition all agree.
+			Sense: store.NormalizeDictText(a.Sense),
 		})
 	}
 
@@ -137,7 +142,10 @@ func (s *Server) handleUpsertWordAnnotation(w http.ResponseWriter, r *http.Reque
 	}
 	req.Word = strings.TrimSpace(req.Word)
 	req.Pos = strings.TrimSpace(req.Pos)
-	req.Sense = strings.TrimSpace(req.Sense)
+	// A sense is dictionary text the reader picked, so it may still carry
+	// ECDICT's literal "\n" when a client holds pre-fix data. Normalise before
+	// trimming so a trailing escape becomes trimmable whitespace.
+	req.Sense = strings.TrimSpace(store.NormalizeDictText(req.Sense))
 	if req.ParagraphID <= 0 || req.SentenceIndex < 0 || req.WordIndex < 0 {
 		writeError(w, http.StatusBadRequest, "标注参数不完整")
 		return

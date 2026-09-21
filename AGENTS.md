@@ -64,6 +64,8 @@ backend/
       errors.go                  #   IsDuplicate / IsNotFound（跨引擎）
       upsert.go                  #   UpsertReturningID（跨引擎拿主键）
       store_test.go              #   8 用例 × 双引擎
+      dicttext.go                #   ECDICT 字面 `\n` → 真换行（见 §4.9）
+      dicttext_test.go           #   该转换的幂等性单测
     server/
       server.go                  #   路由、CORS、SPA 静态托管、鉴权中间件、upsertOn 助手
       auth.go                    #   注册/验证/登录/登出/me
@@ -155,6 +157,26 @@ GORM 生成的 SQL 会自动加反引号，所以模型层无需处理。
 → **不要硬编码 id**（`/api/articles/1` 在线上是 404）；写测试要用真实查询到的 id。
 词典是 `INSERT IGNORE` 语义，幂等，重复灌不会变多。
 
+### 4.9 ECDICT 释义里的换行是**字面**的 `\n`（反斜杠 + n）
+
+`dict_seed.json` 里 `def` 的换行**不是真换行**，而是两个字符 `\` `n`
+（如 `绝对的, 专制的, 完全的, 独立的\nn. 绝对事物`，89k 条里 38436 条如此；另有 1 条 `\r\n`）。
+这是 ECDICT 的原文约定，种子文件原样带进来了。
+
+后果：前端 `.def` 用 `white-space: pre-line` 渲染，只认真换行，所以用户看到的是字面 `\n`。
+**不要用 `v-html` 拼 `<br>` 修**（词典文本进 `v-html` 等于开 XSS 口子）。
+
+正解是 `store.NormalizeDictText`（`internal/store/dicttext.go`，幂等），两个位置都调用：
+
+| 位置 | 作用 |
+| --- | --- |
+| `seed.seedDictionary` | 新库落库即为真换行 |
+| `server.handleDictLookup` | **老库（含线上 MySQL）不必重灌**，读时清洗 |
+| `server.handleArticleState` / `handleUpsertWordAnnotation` | 存量的 `word_annotations.sense` 同样清洗，且与词典的「已选」比对保持一致 |
+
+词典已 `INSERT IGNORE` 灌过时**改种子文件不会生效**（`OnConflict{DoNothing}`），
+所以别指望「改数据 + 升 `dictVersion`」能修线上 —— 那条路只会白跑一遍 89k 行。
+
 ---
 
 ## 5. 命令速查
@@ -214,7 +236,7 @@ TEST_MYSQL_DSN='user:pass@tcp(host:3306)/db' go test -p 1 ./...   # SQLite + MyS
 
 | 包 | 用例 |
 | --- | --- |
-| `internal/store` | 8 个：表名/外键级联/词典大小写/upsert 稳定性/重复键/时间往返/中文 emoji/**零值 default 回归** |
+| `internal/store` | 9 个：表名/外键级联/词典大小写/upsert 稳定性/重复键/时间往返/中文 emoji/**零值 default 回归**/ECDICT 转义（§4.9，纯函数、两引擎无关） |
 | `internal/seed` | 3 个：全量灌入/幂等/`meta` upsert |
 | `internal/sentence` | 断句单测 |
 

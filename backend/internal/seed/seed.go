@@ -107,6 +107,12 @@ func seedDictionary(db *gorm.DB) error {
 		if e.W == "" {
 			continue
 		}
+		// ECDICT writes line breaks inside a definition as a literal "\n"
+		// (backslash + n); store real newlines so every client does not have to
+		// know the convention. See store.NormalizeDictText.
+		for i := range e.S {
+			e.S[i].Def = store.NormalizeDictText(e.S[i].Def)
+		}
 		senses, err := json.Marshal(e.S)
 		if err != nil {
 			return err
