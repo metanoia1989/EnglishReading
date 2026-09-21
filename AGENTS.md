@@ -342,7 +342,8 @@ TEST_MYSQL_DSN='user:pass@tcp(host:3306)/db' go test -p 1 ./...   # SQLite + MyS
 | nginx 反代 | `/www/server/panel/vhost/nginx/extension/reading.metanoia.internal/english-reading.conf` |
 | 站点配置 | `/www/server/panel/vhost/nginx/reading.metanoia.internal.conf` |
 | 后端端口 / 用户 | `:8080` / `www` |
-| **正文内容树** | `/www/server/go_project/english_reading/content`（属主 `www`；由 `CONTENT_ROOT` 指定，**不随二进制走，必须单独同步/备份**） |
+| 索引同步器 | `/www/server/go_project/english_reading/articlesync`（属主 `www`；服务器无 Go，需本地交叉编译后上传） |
+| **正文内容树** | `/www/server/go_project/english_reading/content`（属主 `www`；由 env 里的 `CONTENT_ROOT` 指定，**不随二进制走，必须单独同步/备份**） |
 
 反代关键点：`proxy_pass http://127.0.0.1:8080;` **不带 URI 部分**，所以 `/api/xxx`
 原样透传给后端（后端路由就是按 `/api/...` 注册的）。若写成 `proxy_pass http://127.0.0.1:8080/;`
@@ -368,15 +369,34 @@ ssh metanoia@192.168.10.10 '
 '
 ```
 
+> **重启必然有约 2 秒的 502 窗口**，这是 nohup+pid 重启方式固有的：旧进程被杀到新进程 bind(:8080)
+> 之间没有任何人在监听。实测（120 次探测、间隔 200ms）：kill 后连续 **10 次 `000`
+> （connection refused）**，窗口 13:53:52.560 → 13:53:54.675，其余全部 200。
+> nginx 把它转成 502。**部署时不必惊慌，也不要去查代码**；要彻底消除得换平滑重启
+> （nginx 先摘 upstream、或 systemd socket activation / SO_REUSEPORT 多进程）。
+>
+> 另外：偶发的、不在重启窗口内的 502 多半出在**本地代理**（`HTTP_PROXY=127.0.0.1:7897`）
+> 而不是服务端 —— 判据是 nginx error log 为空且后端访问日志里根本没有这条请求。
+> 本次遇到两次，之后 80 次连测全 200，未能复现。
+
 > 宝塔面板的「Go 项目」管理界面等价于上面的 nohup + pid 文件方式，不是 systemd。
 > 面板里改端口/环境变量会重写 `english-reading.env` 与启动脚本。
 
-**正文内容树要单独部署**（这是本次架构改动带进部署流程的新东西）：
+**正文内容树与同步器要单独部署**（这是本次架构改动带进部署流程的新东西）：
 
 ```bash
-# 内容树与数据库都要备份；只备份 MySQL 已经不够了
+# 同步器（服务器没有 Go，必须本地交叉编译）
+cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o articlesync ./cmd/articlesync
+scp articlesync metanoia@192.168.10.10:/tmp/articlesync
+ssh metanoia@192.168.10.10 'sudo mv /tmp/articlesync /www/server/go_project/english_reading/articlesync && sudo chown www:www /www/server/go_project/english_reading/articlesync && sudo chmod 755 /www/server/go_project/english_reading/articlesync'
+
+# 内容树（与数据库一起备份；只备份 MySQL 已经不够了）
 rsync -av content/ metanoia@192.168.10.10:/www/server/go_project/english_reading/content/
 ssh metanoia@192.168.10.10 'sudo chown -R www:www /www/server/go_project/english_reading/content'
+
+# 在服务器上建索引（env 文件里有 DB_DSN 与 CONTENT_ROOT）
+ssh metanoia@192.168.10.10 'sudo bash -c "set -a; source /www/server/go_project/english_reading/english-reading.env; set +a; \
+  cd /www/server/go_project/english_reading && ./articlesync -dry-run"'
 ```
 
 `english-reading.env` 里加一行 `CONTENT_ROOT=/www/server/go_project/english_reading/content`。
@@ -436,7 +456,8 @@ MySQL 5.7 的硬约束（都已实测）：没有 `RETURNING`、不支持 `CREAT
 | 项 | 状态 |
 | --- | --- |
 | **正文/索引改造尚未提交 git** | ⚠️ 改动仍在工作区。接手第一件事建议先提交 |
-| 内容树未纳入线上部署流程 | 已写入 §7.2，但**尚未在服务器上实际执行**；线上仍是旧的「正文在库里」 |
+| 线上已完成正文/索引改造 | ✅ 2026-09-21：`paragraphs` 已删，10 篇文章 id 4-13 全部保留，users/sessions/dictionary 未动；内容树在 `/www/server/go_project/english_reading/content`，`CONTENT_ROOT` 已写入 env |
+| 线上多了一个测试数据集 | `sample-cleaned`（清洗样例，2 篇）是验证 `txt2articles.py` 流程留下的，删掉：删目录 + `./articlesync -prune` |
 | `internal/content` 无自动化测试 | 靠 §11 的端到端演练验证 |
 | `skip_name_resolve=OFF` 导致内网连接 10s | 未修，需服务端改配置（见 §8.2） |
 | 站点无 SSL | 仅 HTTP |

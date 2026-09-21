@@ -180,12 +180,19 @@ func syncArticle(db *gorm.DB, datasetID int64, art *Article, opts SyncOptions, s
 		return 0, err
 	}
 
-	contentChanged := row.ContentHash != art.ContentHash
+	hashChanged := row.ContentHash != art.ContentHash
+	// A row with no hash yet is being *indexed for the first time* — that is
+	// what happens to every article right after the migration off paragraph
+	// rows, and it is not a content change. Only a hash that moves from one real
+	// value to another means the text under existing annotations moved away, and
+	// only that deserves the warning.
+	contentChanged := hashChanged && row.ContentHash != ""
 	metaChanged := row.DatasetID != datasetID || row.Title != art.Title ||
 		row.Subtitle != art.Subtitle || row.Level != art.Level ||
 		row.Author != art.Author || row.Origin != art.Origin ||
 		row.RelPath != art.RelPath || row.ParagraphCount != art.ParagraphCount ||
-		row.SentenceCount != art.SentenceCount || !sameTime(row.PublishedAt, art.PublishedAt)
+		row.SentenceCount != art.SentenceCount || hashChanged ||
+		!sameTime(row.PublishedAt, art.PublishedAt)
 
 	if adopted {
 		st.ArticlesAdopted++

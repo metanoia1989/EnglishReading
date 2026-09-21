@@ -16,6 +16,11 @@ data/content/
 # One-time migration safety copies written by the paragraph->hash migration
 legacy-anchor-backup-*.json
 
+# Database dumps: contain user emails and password hashes, never commit
+backups/
+*.sql
+*.sql.gz
+
 # OS / editor
 .DS_Store
 *.log
