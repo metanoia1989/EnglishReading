@@ -224,7 +224,10 @@ def strip_gutenberg(text: str, path: Path, rep: Report) -> str:
 def clean_lines(text: str, opts: argparse.Namespace, path: Path, rep: Report) -> list[str]:
     """Normalise characters and drop non-prose lines. Returns surviving lines."""
     text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = text.replace("\f", "\n\n")          # form feed = page break
+    # A form feed marks a page boundary, not a paragraph boundary: turning it
+    #    into a blank line splits any paragraph that happens to span two pages.
+    #    A single newline keeps the reflow able to rejoin it.
+    text = text.replace("\f", "\n")
     text = text.translate(ZERO_WIDTH)
     if not opts.keep_typography:
         for src, dst in TYPOGRAPHY.items():
@@ -253,9 +256,18 @@ def clean_lines(text: str, opts: argparse.Namespace, path: Path, rep: Report) ->
 def join_wrapped_lines(lines: list[str], opts: argparse.Namespace) -> list[str]:
     """Reflow hard-wrapped lines into logical paragraphs.
 
-    Blank line = paragraph boundary. A line starting with 4+ spaces or containing
-    only a short ALL-CAPS/CHAPTER heading also starts a new paragraph, which is
-    how most plain-text editions signal structure.
+    Default (blank-line) mode: a blank line ends a paragraph, and consecutive
+    non-blank lines are one wrapped paragraph. That is what plain-text editions
+    and ``pdftotext`` produce.
+
+    ``--line-per-paragraph`` mode: every non-blank line is its own paragraph.
+    Use it for extractors that emit one newline per paragraph and never hard-wrap
+    — ``textutil -convert txt`` on .docx/.rtf, or LibreOffice --convert-to txt.
+    Without it those documents collapse into a single giant paragraph, because
+    they contain no blank lines at all.
+
+    A line starting with 4+ spaces, or a short CHAPTER/ALL-CAPS heading, also
+    starts a new paragraph in either mode.
     """
     paragraphs: list[str] = []
     buf: list[str] = []
@@ -271,6 +283,10 @@ def join_wrapped_lines(lines: list[str], opts: argparse.Namespace) -> list[str]:
             continue
         indented = line.startswith("    ") or line.startswith("  ") and opts.indent_starts_paragraph
         headingish = bool(CHAPTER_HEADING.match(line)) or bool(ALLCAPS_HEADING.match(line))
+        if opts.line_per_paragraph:
+            flush()
+            paragraphs.append(line.strip())
+            continue
         if (indented or headingish) and buf:
             flush()
         buf.append(line.strip())
@@ -434,6 +450,10 @@ def main() -> int:
                     help="keep curly quotes/dashes instead of normalising to ASCII")
     ap.add_argument("--no-page-number-strip", dest="strip_page_numbers",
                     action="store_false", help="keep lines that are only a number")
+    ap.add_argument("--line-per-paragraph", action="store_true",
+                    help="treat every non-blank line as its own paragraph: for extractors that "
+                         "emit one newline per paragraph and never hard-wrap "
+                         "(textutil on .docx/.rtf, LibreOffice --convert-to txt)")
     ap.add_argument("--indent-starts-paragraph", action="store_true", default=True,
                     help="treat indented lines as new paragraphs (default)")
     ap.add_argument("--split-regex", default="",

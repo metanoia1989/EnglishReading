@@ -118,6 +118,7 @@ frontend/
   src/components/                # 句子渲染、词典弹窗、就地批注编辑器
   vite.config.*                  # dev 代理 /api → 8080
 docs/
+  content-spec.md                # ★ 语料规范 / 数据库范式 / 清洗原理 / 各类文档转换（见 §10）
   gorm-migration-plan.md         # GORM 改造规划 + 实施结果（含验证数据）
   mysql-migration-assessment.md  # SQLite→MySQL 可行性评估 + 服务器实测结论
 tools/
@@ -503,6 +504,10 @@ curl -s "$B/api/dict/lookup?word=The"         # found=true（大小写不敏感�
    `NoteModal.vue` 已删除，不要把它加回来。
 
 ## 10. 导入自己的语料（大批量 txt）
+
+> **完整规范见 `docs/content-spec.md`**：内容树与文章文件的逐字段定义、数据库每张表每列的语义、
+> 清洗流水线的每一步及其后果、epub/pdf/docx/html/md 各自的转换通道与实测坑、验收流程、症状对照表。
+> 本节只是命令速查。
 
 正文是文件，所以"导入"分两步：**清洗成文件** → **扫描建索引**。没有一步会删用户数据。
 

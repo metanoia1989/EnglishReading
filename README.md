@@ -223,6 +223,9 @@ article_id + paragraph_hash + sentence_index + word_index
 
 ## 导入自己的语料
 
+> 数据格式规范、数据库存储说明与各类文档（pdf / epub / docx / html / md）的转换方法，
+> 见 [`docs/content-spec.md`](docs/content-spec.md)。
+
 ```bash
 # 1) 清洗：raw txt → 合规语料 JSON（不碰数据库，可反复跑）
 python3 tools/txt2articles.py corpus/ -o corpus.json \
