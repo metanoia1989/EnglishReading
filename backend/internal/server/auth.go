@@ -2,8 +2,8 @@ package server
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
+	"errors"
 	"log"
 	"net/http"
 	"regexp"
@@ -11,6 +11,9 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
+
+	"english-reading/backend/internal/store"
 )
 
 type authUser struct {
@@ -20,6 +23,10 @@ type authUser struct {
 }
 
 var emailPattern = regexp.MustCompile(`^[^@\s]+@[^@\s]+\.[^@\s]+$`)
+
+// errEmailTaken lets the registration transaction report a duplicate account
+// without inspecting driver-specific error text.
+var errEmailTaken = errors.New("email already registered")
 
 type registerRequest struct {
 	Email    string `json:"email"`
@@ -65,15 +72,15 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		req.Nickname = strings.SplitN(req.Email, "@", 2)[0]
 	}
 
-	var exists int
-	err := s.db.QueryRow(`SELECT 1 FROM users WHERE email = ?`, req.Email).Scan(&exists)
-	if err == nil {
-		writeError(w, http.StatusConflict, "该邮箱已注册，请直接登录")
-		return
-	}
-	if err != sql.ErrNoRows {
+	var existing int64
+	if err := s.db.Model(&store.User{}).Where("email = ?", req.Email).
+		Count(&existing).Error; err != nil {
 		writeError(w, http.StatusInternalServerError, "服务器开小差了")
 		log.Printf("register check: %v", err)
+		return
+	}
+	if existing > 0 {
+		writeError(w, http.StatusConflict, "该邮箱已注册，请直接登录")
 		return
 	}
 
@@ -83,16 +90,16 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	code := randomDigits(6)
-	expires := time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339)
-	if _, err := s.db.Exec(`
-		INSERT INTO pending_registrations(email, password_hash, nickname, code, expires_at)
-		VALUES(?, ?, ?, ?, ?)
-		ON CONFLICT(email) DO UPDATE SET
-			password_hash = excluded.password_hash,
-			nickname      = excluded.nickname,
-			code          = excluded.code,
-			expires_at    = excluded.expires_at`,
-		req.Email, hash, req.Nickname, code, expires); err != nil {
+	pending := store.PendingRegistration{
+		Email:        req.Email,
+		PasswordHash: hash,
+		Nickname:     req.Nickname,
+		Code:         code,
+		ExpiresAt:    time.Now().Add(10 * time.Minute).UTC(),
+	}
+	// Upsert: re-requesting a code replaces the previous pending registration.
+	if err := s.db.Clauses(upsertOn("email", "password_hash", "nickname", "code", "expires_at")).
+		Create(&pending).Error; err != nil {
 		writeError(w, http.StatusInternalServerError, "验证码生成失败")
 		log.Printf("insert pending registration: %v", err)
 		return
@@ -117,16 +124,9 @@ func (s *Server) handleVerifyRegister(w http.ResponseWriter, r *http.Request) {
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	req.Code = strings.TrimSpace(req.Code)
 
-	var pending struct {
-		Hash     string
-		Nickname string
-		Expires  string
-	}
-	err := s.db.QueryRow(`
-		SELECT password_hash, nickname, expires_at
-		FROM pending_registrations WHERE email = ?`, req.Email).
-		Scan(&pending.Hash, &pending.Nickname, &pending.Expires)
-	if err == sql.ErrNoRows {
+	var pending store.PendingRegistration
+	err := s.db.Where("email = ?", req.Email).Take(&pending).Error
+	if store.IsNotFound(err) {
 		writeError(w, http.StatusBadRequest, "请先获取验证码")
 		return
 	}
@@ -134,58 +134,48 @@ func (s *Server) handleVerifyRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "服务器开小差了")
 		return
 	}
-	expiresAt, err := time.Parse(time.RFC3339, pending.Expires)
-	if err != nil || time.Now().After(expiresAt) {
+	if time.Now().After(pending.ExpiresAt) {
 		writeError(w, http.StatusBadRequest, "验证码已过期，请重新获取")
 		return
 	}
-
-	var storedCode string
-	err = s.db.QueryRow(`SELECT code FROM pending_registrations WHERE email = ?`, req.Email).Scan(&storedCode)
-	if err != nil || storedCode != req.Code {
+	if pending.Code != req.Code {
 		writeError(w, http.StatusBadRequest, "验证码不正确")
 		return
 	}
 
-	tx, err := s.db.Begin()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "服务器开小差了")
-		return
-	}
-	defer tx.Rollback()
-
-	res, err := tx.Exec(`INSERT INTO users(email, nickname, password_hash) VALUES(?, ?, ?)`,
-		req.Email, pending.Nickname, pending.Hash)
-	if err != nil {
-		if strings.Contains(err.Error(), "UNIQUE") {
-			writeError(w, http.StatusConflict, "该邮箱已注册，请直接登录")
-		} else {
-			writeError(w, http.StatusInternalServerError, "创建账号失败")
+	var (
+		token string
+		user  authUser
+	)
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		record := store.User{
+			Email:        req.Email,
+			Nickname:     pending.Nickname,
+			PasswordHash: pending.PasswordHash,
 		}
-		return
-	}
-	userID, err := res.LastInsertId()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "创建账号失败")
-		return
-	}
-	token, err := issueToken(tx, userID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "创建会话失败")
-		return
-	}
-	if _, err := tx.Exec(`DELETE FROM pending_registrations WHERE email = ?`, req.Email); err != nil {
-		writeError(w, http.StatusInternalServerError, "清理验证记录失败")
-		return
-	}
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, "注册失败，请重试")
-		return
-	}
-	writeJSON(w, http.StatusOK, sessionResponse{
-		Token: token,
-		User:  authUser{ID: userID, Email: req.Email, Nickname: pending.Nickname},
+		if err := tx.Create(&record).Error; err != nil {
+			if store.IsDuplicate(err) {
+				return errEmailTaken
+			}
+			return err
+		}
+		t, err := issueToken(tx, record.ID)
+		if err != nil {
+			return err
+		}
+		token = t
+		user = authUser{ID: record.ID, Email: record.Email, Nickname: record.Nickname}
+		return tx.Where("email = ?", req.Email).Delete(&store.PendingRegistration{}).Error
 	})
+	switch {
+	case errors.Is(err, errEmailTaken):
+		writeError(w, http.StatusConflict, "该邮箱已注册，请直接登录")
+	case err != nil:
+		log.Printf("verify register: %v", err)
+		writeError(w, http.StatusInternalServerError, "注册失败，请重试")
+	default:
+		writeJSON(w, http.StatusOK, sessionResponse{Token: token, User: user})
+	}
 }
 
 func randomDigits(n int) string {
@@ -211,11 +201,10 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
-	var u authUser
-	var hash string
-	err := s.db.QueryRow(`SELECT id, email, nickname, password_hash FROM users WHERE email = ?`, req.Email).
-		Scan(&u.ID, &u.Email, &u.Nickname, &hash)
-	if err == sql.ErrNoRows {
+
+	var record store.User
+	err := s.db.Where("email = ?", req.Email).Take(&record).Error
+	if store.IsNotFound(err) {
 		writeError(w, http.StatusUnauthorized, "邮箱或密码不正确")
 		return
 	}
@@ -223,40 +212,47 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "服务器开小差了")
 		return
 	}
-	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(req.Password)) != nil {
+	if bcrypt.CompareHashAndPassword([]byte(record.PasswordHash), []byte(req.Password)) != nil {
 		writeError(w, http.StatusUnauthorized, "邮箱或密码不正确")
 		return
 	}
-	token, err := issueToken(s.db, u.ID)
+	token, err := issueToken(s.db, record.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "登录失败，请重试")
 		return
 	}
-	writeJSON(w, http.StatusOK, sessionResponse{Token: token, User: u})
+	writeJSON(w, http.StatusOK, sessionResponse{
+		Token: token,
+		User:  authUser{ID: record.ID, Email: record.Email, Nickname: record.Nickname},
+	})
 }
 
-// issueToken writes a random session token. It accepts either *sql.DB or
-// *sql.Tx so it can be reused inside registration transactions.
-type tokenInserter interface {
-	Exec(query string, args ...any) (sql.Result, error)
-}
-
-func issueToken(db tokenInserter, userID int64) (string, error) {
+// issueToken writes a random session token. It accepts either *gorm.DB or
+// *gorm.DB inside a transaction, since GORM's *gorm.DB is the same type in
+// both cases.
+func issueToken(db *gorm.DB, userID int64) (string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
 	}
 	token := hex.EncodeToString(raw)
-	expires := time.Now().Add(30 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	_, err := db.Exec(`INSERT INTO sessions(token, user_id, expires_at) VALUES(?, ?, ?)`,
-		token, userID, expires)
-	return token, err
+	session := store.Session{
+		Token:     token,
+		UserID:    userID,
+		ExpiresAt: time.Now().Add(30 * 24 * time.Hour).UTC(),
+	}
+	if err := db.Create(&session).Error; err != nil {
+		return "", err
+	}
+	return token, nil
 }
 
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request, _ authUser) {
 	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 	if token != "" {
-		_, _ = s.db.Exec(`DELETE FROM sessions WHERE token = ?`, token)
+		if err := s.db.Where("token = ?", token).Delete(&store.Session{}).Error; err != nil {
+			log.Printf("logout: %v", err)
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

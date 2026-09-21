@@ -12,14 +12,16 @@ import (
 
 func main() {
 	port := envOr("PORT", "8080")
-	dbPath := envOr("DB_PATH", "data/app.db")
 	distDir := envOr("FRONTEND_DIST", firstExisting("../frontend/dist", "frontend/dist"))
 
-	db, err := store.Open(dbPath)
+	cfg := store.FromEnv()
+	db, err := store.Open(cfg)
 	if err != nil {
 		log.Fatalf("open database: %v", err)
 	}
-	defer db.Close()
+	if sqlDB, err := db.DB(); err == nil {
+		defer sqlDB.Close()
+	}
 
 	if err := seed.Run(db); err != nil {
 		log.Fatalf("seed database: %v", err)
@@ -27,7 +29,7 @@ func main() {
 
 	handler := server.New(db, distDir)
 	addr := ":" + port
-	log.Printf("[server] English Reading listening on http://127.0.0.1%s", addr)
+	log.Printf("[server] English Reading listening on http://127.0.0.1%s (db: %s)", addr, cfg.Driver)
 	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatal(err)
 	}

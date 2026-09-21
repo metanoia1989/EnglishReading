@@ -1,14 +1,16 @@
 package server
 
 import (
-	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
 
+	"gorm.io/gorm"
+
 	"english-reading/backend/internal/sentence"
+	"english-reading/backend/internal/store"
 )
 
 func pathID(r *http.Request, name string) (int64, error) {
@@ -47,26 +49,32 @@ type paragraphDTO struct {
 }
 
 func (s *Server) handleDatasets(w http.ResponseWriter, r *http.Request) {
-	rows, err := s.db.Query(`
-		SELECT d.id, d.slug, d.title, d.description, d.emoji, d.color,
-		       (SELECT COUNT(*) FROM articles a WHERE a.dataset_id = d.id) AS article_count
-		FROM datasets d ORDER BY d.id`)
+	var rows []datasetDTO
+	err := s.db.Model(&store.Dataset{}).
+		Select(`datasets.id, datasets.slug, datasets.title, datasets.description,
+		        datasets.emoji, datasets.color,
+		        (SELECT COUNT(*) FROM articles a WHERE a.dataset_id = datasets.id) AS article_count`).
+		Order("datasets.id").
+		Scan(&rows).Error
 	if err != nil {
+		log.Printf("list datasets: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取数据集失败")
 		return
 	}
-	defer rows.Close()
-
-	list := make([]datasetDTO, 0)
-	for rows.Next() {
-		var d datasetDTO
-		if err := rows.Scan(&d.ID, &d.Slug, &d.Title, &d.Description, &d.Emoji, &d.Color, &d.ArticleCount); err != nil {
-			writeError(w, http.StatusInternalServerError, "读取数据集失败")
-			return
-		}
-		list = append(list, d)
+	if rows == nil {
+		rows = []datasetDTO{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"datasets": list})
+	writeJSON(w, http.StatusOK, map[string]any{"datasets": rows})
+}
+
+// datasetArticlesRow is the flattened projection for the article list.
+type datasetArticlesRow struct {
+	ID             int64  `gorm:"column:id"`
+	DatasetID      int64  `gorm:"column:dataset_id"`
+	Title          string `gorm:"column:title"`
+	Subtitle       string `gorm:"column:subtitle"`
+	Level          string `gorm:"column:level"`
+	ParagraphCount int64  `gorm:"column:paragraph_count"`
 }
 
 func (s *Server) handleDatasetArticles(w http.ResponseWriter, r *http.Request) {
@@ -75,42 +83,47 @@ func (s *Server) handleDatasetArticles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "无效的数据集 ID")
 		return
 	}
-	var ds datasetDTO
-	err = s.db.QueryRow(`SELECT id, slug, title, description, emoji, color FROM datasets WHERE id = ?`, id).
-		Scan(&ds.ID, &ds.Slug, &ds.Title, &ds.Description, &ds.Emoji, &ds.Color)
-	if err == sql.ErrNoRows {
+
+	var ds store.Dataset
+	err = s.db.Where("id = ?", id).Take(&ds).Error
+	if store.IsNotFound(err) {
 		writeError(w, http.StatusNotFound, "数据集不存在")
 		return
 	}
 	if err != nil {
+		log.Printf("load dataset: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取数据集失败")
 		return
 	}
 
-	rows, err := s.db.Query(`
-		SELECT a.id, a.dataset_id, a.title, a.subtitle, a.level,
-		       (SELECT COUNT(*) FROM paragraphs p WHERE p.article_id = a.id AND p.kind = 'text') AS paragraph_count
-		FROM articles a WHERE a.dataset_id = ? ORDER BY a.id`, id)
+	var rows []datasetArticlesRow
+	err = s.db.Model(&store.Article{}).
+		Select(`articles.id, articles.dataset_id, articles.title, articles.subtitle, articles.level,
+		        (SELECT COUNT(*) FROM paragraphs p WHERE p.article_id = articles.id AND p.kind = 'text') AS paragraph_count`).
+		Where("articles.dataset_id = ?", id).
+		Order("articles.id").
+		Scan(&rows).Error
 	if err != nil {
+		log.Printf("list articles: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取文章列表失败")
 		return
 	}
-	defer rows.Close()
 
-	articles := make([]map[string]any, 0)
-	for rows.Next() {
-		var a articleDTO
-		var paragraphCount int64
-		if err := rows.Scan(&a.ID, &a.DatasetID, &a.Title, &a.Subtitle, &a.Level, &paragraphCount); err != nil {
-			writeError(w, http.StatusInternalServerError, "读取文章列表失败")
-			return
-		}
+	articles := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
 		articles = append(articles, map[string]any{
-			"id": a.ID, "datasetId": a.DatasetID, "title": a.Title,
-			"subtitle": a.Subtitle, "level": a.Level, "paragraphCount": paragraphCount,
+			"id": row.ID, "datasetId": row.DatasetID, "title": row.Title,
+			"subtitle": row.Subtitle, "level": row.Level,
+			"paragraphCount": row.ParagraphCount,
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"dataset": ds, "articles": articles})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dataset": datasetDTO{
+			ID: ds.ID, Slug: ds.Slug, Title: ds.Title, Description: ds.Description,
+			Emoji: ds.Emoji, Color: ds.Color,
+		},
+		"articles": articles,
+	})
 }
 
 func (s *Server) handleArticleDetail(w http.ResponseWriter, r *http.Request) {
@@ -120,69 +133,80 @@ func (s *Server) handleArticleDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var art articleDTO
-	var ds datasetDTO
-	err = s.db.QueryRow(`
-		SELECT a.id, a.dataset_id, a.title, a.subtitle, a.level,
-		       d.id, d.slug, d.title, d.description, d.emoji, d.color
-		FROM articles a JOIN datasets d ON d.id = a.dataset_id
-		WHERE a.id = ?`, articleID).
-		Scan(&art.ID, &art.DatasetID, &art.Title, &art.Subtitle, &art.Level,
-			&ds.ID, &ds.Slug, &ds.Title, &ds.Description, &ds.Emoji, &ds.Color)
-	if err == sql.ErrNoRows {
+	var art store.Article
+	err = s.db.Where("id = ?", articleID).Take(&art).Error
+	if store.IsNotFound(err) {
 		writeError(w, http.StatusNotFound, "文章不存在")
 		return
 	}
 	if err != nil {
+		log.Printf("load article: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取文章失败")
 		return
 	}
 
-	rows, err := s.db.Query(`
-		SELECT id, seq, kind, content FROM paragraphs WHERE article_id = ? ORDER BY seq`, articleID)
-	if err != nil {
+	var ds store.Dataset
+	if err := s.db.Where("id = ?", art.DatasetID).Take(&ds).Error; err != nil {
+		log.Printf("load dataset %d: %v", art.DatasetID, err)
+		writeError(w, http.StatusInternalServerError, "读取数据集失败")
+		return
+	}
+
+	var paras []store.Paragraph
+	if err := s.db.Where("article_id = ?", articleID).
+		Order("seq").Find(&paras).Error; err != nil {
+		log.Printf("load paragraphs: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取段落失败")
 		return
 	}
-	defer rows.Close()
 
-	paragraphs := make([]paragraphDTO, 0)
-	for rows.Next() {
-		var p paragraphDTO
-		if err := rows.Scan(&p.ID, &p.Seq, &p.Kind, &p.Content); err != nil {
-			writeError(w, http.StatusInternalServerError, "读取段落失败")
-			return
+	paragraphs := make([]paragraphDTO, 0, len(paras))
+	for _, p := range paras {
+		dto := paragraphDTO{
+			ID: p.ID, Seq: p.Seq, Kind: p.Kind, Content: p.Content,
+			Sentences: make([]sentenceDTO, 0),
 		}
-		p.Sentences = make([]sentenceDTO, 0)
 		if p.Kind == "text" {
 			for i, text := range sentence.Split(p.Content) {
-				p.Sentences = append(p.Sentences, sentenceDTO{Index: i, Text: text})
+				dto.Sentences = append(dto.Sentences, sentenceDTO{Index: i, Text: text})
 			}
 		}
-		paragraphs = append(paragraphs, p)
+		paragraphs = append(paragraphs, dto)
 	}
 
-	var prevID, nextID sql.NullInt64
-	_ = s.db.QueryRow(`SELECT MAX(id) FROM articles WHERE dataset_id = ? AND id < ?`, art.DatasetID, articleID).Scan(&prevID)
-	_ = s.db.QueryRow(`SELECT MIN(id) FROM articles WHERE dataset_id = ? AND id > ?`, art.DatasetID, articleID).Scan(&nextID)
-
 	writeJSON(w, http.StatusOK, map[string]any{
-		"article":          art,
-		"dataset":          ds,
-		"paragraphs":       paragraphs,
-		"prevArticleId":    nullInt(prevID),
-		"nextArticleId":    nullInt(nextID),
-		"paragraphCount":   len(paragraphs),
+		"article": articleDTO{
+			ID: art.ID, DatasetID: art.DatasetID, Title: art.Title,
+			Subtitle: art.Subtitle, Level: art.Level,
+		},
+		"dataset": datasetDTO{
+			ID: ds.ID, Slug: ds.Slug, Title: ds.Title, Description: ds.Description,
+			Emoji: ds.Emoji, Color: ds.Color,
+		},
+		"paragraphs":        paragraphs,
+		"prevArticleId":     neighbourArticleID(s.db, art.DatasetID, articleID, true),
+		"nextArticleId":     neighbourArticleID(s.db, art.DatasetID, articleID, false),
+		"paragraphCount":    len(paragraphs),
 		"sentenceSplitInfo": "句子由后端按英文标点规则切分，标注键为 paragraph_id + sentence_index + word_index",
 	})
 }
 
-func nullInt(n sql.NullInt64) *int64 {
-	if !n.Valid {
+// neighbourArticleID returns the id of the previous (before=true) or next
+// article within the same dataset, or nil when there is none.
+func neighbourArticleID(db *gorm.DB, datasetID, articleID int64, before bool) *int64 {
+	query := db.Model(&store.Article{}).Where("dataset_id = ?", datasetID)
+	if before {
+		query = query.Where("id < ?", articleID).Order("id DESC")
+	} else {
+		query = query.Where("id > ?", articleID).Order("id ASC")
+	}
+
+	var found []int64
+	if err := query.Limit(1).Pluck("id", &found).Error; err != nil || len(found) == 0 {
 		return nil
 	}
-	v := n.Int64
-	return &v
+	id := found[0]
+	return &id
 }
 
 func (s *Server) handleDictLookup(w http.ResponseWriter, r *http.Request) {
@@ -218,14 +242,15 @@ func (s *Server) handleDictLookup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		found     string
-		phonetic  string
-		sensesRaw string
+		entry store.Dictionary
+		found bool
 	)
 	for _, candidate := range candidates {
-		err := s.db.QueryRow(`SELECT word, phonetic, senses_json FROM dictionary WHERE word = ? LIMIT 1`, candidate).
-			Scan(&found, &phonetic, &sensesRaw)
-		if err == sql.ErrNoRows {
+		// The column collation makes this match case-insensitively on both
+		// engines (COLLATE NOCASE on SQLite, utf8mb4_general_ci on MySQL).
+		var hit store.Dictionary
+		err := s.db.Where("word = ?", candidate).Take(&hit).Error
+		if store.IsNotFound(err) {
 			continue
 		}
 		if err != nil {
@@ -233,19 +258,21 @@ func (s *Server) handleDictLookup(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "词典查询失败")
 			return
 		}
+		entry, found = hit, true
 		break
 	}
-	if found == "" {
+	if !found {
 		writeJSON(w, http.StatusOK, map[string]any{"word": word, "found": false, "senses": []any{}})
 		return
 	}
+
 	var senses []dictSenseDTO
-	if err := json.Unmarshal([]byte(sensesRaw), &senses); err != nil {
+	if err := json.Unmarshal([]byte(entry.SensesJSON), &senses); err != nil {
 		writeError(w, http.StatusInternalServerError, "词典数据损坏")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"word": found, "phonetic": phonetic, "found": true, "senses": senses,
+		"word": string(entry.Word), "phonetic": entry.Phonetic, "found": true, "senses": senses,
 	})
 }
 

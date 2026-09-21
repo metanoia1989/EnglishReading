@@ -1,7 +1,6 @@
 package server
 
 import (
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,18 +11,40 @@ import (
 	"strings"
 	"time"
 
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
 	"english-reading/backend/internal/translate"
 )
 
 // Server bundles the HTTP API dependencies.
 type Server struct {
-	db        *sql.DB
+	db        *gorm.DB
 	translate *translate.Client
+}
+
+// upsertOn builds an "insert, or update these columns on conflict" clause for
+// the given conflict column. GORM renders it as ON CONFLICT ... DO UPDATE on
+// SQLite and ON DUPLICATE KEY UPDATE on MySQL.
+func upsertOn(conflictColumn string, updateColumns ...string) clause.OnConflict {
+	return upsertOnColumns([]string{conflictColumn}, updateColumns)
+}
+
+// upsertOnColumns is upsertOn for composite unique keys.
+func upsertOnColumns(conflictColumns, updateColumns []string) clause.OnConflict {
+	columns := make([]clause.Column, 0, len(conflictColumns))
+	for _, name := range conflictColumns {
+		columns = append(columns, clause.Column{Name: name})
+	}
+	return clause.OnConflict{
+		Columns:   columns,
+		DoUpdates: clause.AssignmentColumns(updateColumns),
+	}
 }
 
 // New builds the router, including CORS, API routes and (when a built
 // frontend directory exists) the SPA static handler.
-func New(db *sql.DB, frontendDist string) http.Handler {
+func New(db *gorm.DB, frontendDist string) http.Handler {
 	s := &Server{db: db, translate: translate.New()}
 
 	mux := http.NewServeMux()
@@ -178,11 +199,11 @@ func (s *Server) authenticate(r *http.Request) (authUser, error) {
 		return authUser{}, errors.New("empty token")
 	}
 	var u authUser
-	err := s.db.QueryRow(`
-		SELECT u.id, u.email, u.nickname
-		FROM sessions s JOIN users u ON u.id = s.user_id
-		WHERE s.token = ? AND s.expires_at > ?`,
-		token, time.Now().UTC().Format(time.RFC3339)).Scan(&u.ID, &u.Email, &u.Nickname)
+	err := s.db.Table("sessions").
+		Select("users.id AS id, users.email AS email, users.nickname AS nickname").
+		Joins("JOIN users ON users.id = sessions.user_id").
+		Where("sessions.token = ? AND sessions.expires_at > ?", token, time.Now().UTC()).
+		Take(&u).Error
 	if err != nil {
 		return authUser{}, err
 	}

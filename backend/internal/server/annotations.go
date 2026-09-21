@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -10,7 +9,10 @@ import (
 	"net/http"
 	"strings"
 
+	"gorm.io/gorm/clause"
+
 	"english-reading/backend/internal/sentence"
+	"english-reading/backend/internal/store"
 )
 
 type wordAnnotationDTO struct {
@@ -41,6 +43,12 @@ type translationDTO struct {
 	TranslatedText string `json:"translatedText"`
 }
 
+// The composite unique keys reused by the upserts below.
+var (
+	wordAnnotationKey  = []string{"user_id", "article_id", "paragraph_id", "sentence_index", "word_index"}
+	userTranslationKey = []string{"user_id", "article_id", "paragraph_id", "sentence_index"}
+)
+
 func (s *Server) handleArticleState(w http.ResponseWriter, r *http.Request, user authUser) {
 	articleID, err := pathID(r, "id")
 	if err != nil {
@@ -48,65 +56,55 @@ func (s *Server) handleArticleState(w http.ResponseWriter, r *http.Request, user
 		return
 	}
 
-	words := make([]wordAnnotationDTO, 0)
-	rows, err := s.db.Query(`
-		SELECT id, article_id, paragraph_id, sentence_index, word_index, word, pos, sense
-		FROM word_annotations WHERE user_id = ? AND article_id = ? ORDER BY paragraph_id, sentence_index, word_index`,
-		user.ID, articleID)
-	if err != nil {
+	var annotations []store.WordAnnotation
+	if err := s.db.Where("user_id = ? AND article_id = ?", user.ID, articleID).
+		Order("paragraph_id, sentence_index, word_index").
+		Find(&annotations).Error; err != nil {
+		log.Printf("load word annotations: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取单词标注失败")
 		return
 	}
-	for rows.Next() {
-		var a wordAnnotationDTO
-		if err := rows.Scan(&a.ID, &a.ArticleID, &a.ParagraphID, &a.SentenceIndex, &a.WordIndex, &a.Word, &a.Pos, &a.Sense); err != nil {
-			rows.Close()
-			writeError(w, http.StatusInternalServerError, "读取单词标注失败")
-			return
-		}
-		words = append(words, a)
+	words := make([]wordAnnotationDTO, 0, len(annotations))
+	for _, a := range annotations {
+		words = append(words, wordAnnotationDTO{
+			ID: a.ID, ArticleID: a.ArticleID, ParagraphID: a.ParagraphID,
+			SentenceIndex: a.SentenceIndex, WordIndex: a.WordIndex,
+			Word: a.Word, Pos: a.Pos, Sense: a.Sense,
+		})
 	}
-	rows.Close()
 
-	notes := make([]noteDTO, 0)
-	rows, err = s.db.Query(`
-		SELECT id, article_id, paragraph_id, sentence_index, content
-		FROM notes WHERE user_id = ? AND article_id = ? ORDER BY paragraph_id, sentence_index, id`,
-		user.ID, articleID)
-	if err != nil {
+	var noteRows []store.Note
+	if err := s.db.Where("user_id = ? AND article_id = ?", user.ID, articleID).
+		Order("paragraph_id, sentence_index, id").
+		Find(&noteRows).Error; err != nil {
+		log.Printf("load notes: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取批注失败")
 		return
 	}
-	for rows.Next() {
-		var n noteDTO
-		if err := rows.Scan(&n.ID, &n.ArticleID, &n.ParagraphID, &n.SentenceIndex, &n.Content); err != nil {
-			rows.Close()
-			writeError(w, http.StatusInternalServerError, "读取批注失败")
-			return
-		}
-		notes = append(notes, n)
+	notes := make([]noteDTO, 0, len(noteRows))
+	for _, n := range noteRows {
+		notes = append(notes, noteDTO{
+			ID: n.ID, ArticleID: n.ArticleID, ParagraphID: n.ParagraphID,
+			SentenceIndex: n.SentenceIndex, Content: n.Content,
+		})
 	}
-	rows.Close()
 
-	translations := make([]translationDTO, 0)
-	rows, err = s.db.Query(`
-		SELECT id, article_id, paragraph_id, sentence_index, source_text, translated_text
-		FROM user_translations WHERE user_id = ? AND article_id = ? ORDER BY paragraph_id, sentence_index`,
-		user.ID, articleID)
-	if err != nil {
+	var translationRows []store.UserTranslation
+	if err := s.db.Where("user_id = ? AND article_id = ?", user.ID, articleID).
+		Order("paragraph_id, sentence_index").
+		Find(&translationRows).Error; err != nil {
+		log.Printf("load translations: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取翻译失败")
 		return
 	}
-	for rows.Next() {
-		var t translationDTO
-		if err := rows.Scan(&t.ID, &t.ArticleID, &t.ParagraphID, &t.SentenceIndex, &t.SourceText, &t.TranslatedText); err != nil {
-			rows.Close()
-			writeError(w, http.StatusInternalServerError, "读取翻译失败")
-			return
-		}
-		translations = append(translations, t)
+	translations := make([]translationDTO, 0, len(translationRows))
+	for _, t := range translationRows {
+		translations = append(translations, translationDTO{
+			ID: t.ID, ArticleID: t.ArticleID, ParagraphID: t.ParagraphID,
+			SentenceIndex: t.SentenceIndex, SourceText: t.SourceText,
+			TranslatedText: t.TranslatedText,
+		})
 	}
-	rows.Close()
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"wordAnnotations": words,
@@ -161,17 +159,18 @@ func (s *Server) handleUpsertWordAnnotation(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	var id int64
-	err = s.db.QueryRow(`
-		INSERT INTO word_annotations
-			(user_id, article_id, paragraph_id, sentence_index, word_index, word, pos, sense)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(user_id, article_id, paragraph_id, sentence_index, word_index)
-		DO UPDATE SET word = excluded.word, pos = excluded.pos, sense = excluded.sense,
-		              updated_at = CURRENT_TIMESTAMP
-		RETURNING id`,
-		user.ID, articleID, req.ParagraphID, req.SentenceIndex, req.WordIndex,
-		req.Word, req.Pos, req.Sense).Scan(&id)
+	row := store.WordAnnotation{
+		UserID: user.ID, ArticleID: articleID, ParagraphID: req.ParagraphID,
+		SentenceIndex: req.SentenceIndex, WordIndex: req.WordIndex,
+		Word: req.Word, Pos: req.Pos, Sense: req.Sense,
+	}
+	// Upsert + read the id back in one transaction: GORM cannot return the
+	// existing row id on MySQL, where clause.Returning is dropped and
+	// LastInsertId() is 0 when the update is a no-op. See store.UpsertReturningID.
+	id, err := store.UpsertReturningID(s.db, &row,
+		upsertOnColumns(wordAnnotationKey, []string{"word", "pos", "sense", "updated_at"}),
+		"user_id = ? AND article_id = ? AND paragraph_id = ? AND sentence_index = ? AND word_index = ?",
+		[]any{user.ID, articleID, req.ParagraphID, req.SentenceIndex, req.WordIndex})
 	if err != nil {
 		log.Printf("upsert word annotation: %v", err)
 		writeError(w, http.StatusInternalServerError, "保存单词标注失败")
@@ -194,13 +193,14 @@ func (s *Server) handleDeleteWordAnnotation(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusBadRequest, "无效的标注 ID")
 		return
 	}
-	res, err := s.db.Exec(`DELETE FROM word_annotations WHERE id = ? AND user_id = ? AND article_id = ?`,
-		annotationID, user.ID, articleID)
-	if err != nil {
+	res := s.db.Where("id = ? AND user_id = ? AND article_id = ?", annotationID, user.ID, articleID).
+		Delete(&store.WordAnnotation{})
+	if res.Error != nil {
+		log.Printf("delete word annotation: %v", res.Error)
 		writeError(w, http.StatusInternalServerError, "删除失败")
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if res.RowsAffected == 0 {
 		writeError(w, http.StatusNotFound, "标注不存在")
 		return
 	}
@@ -243,18 +243,17 @@ func (s *Server) handleCreateNote(w http.ResponseWriter, r *http.Request, user a
 		return
 	}
 
-	res, err := s.db.Exec(`
-		INSERT INTO notes(user_id, article_id, paragraph_id, sentence_index, content)
-		VALUES(?, ?, ?, ?, ?)`,
-		user.ID, articleID, req.ParagraphID, req.SentenceIndex, req.Content)
-	if err != nil {
+	note := store.Note{
+		UserID: user.ID, ArticleID: articleID, ParagraphID: req.ParagraphID,
+		SentenceIndex: req.SentenceIndex, Content: req.Content,
+	}
+	if err := s.db.Create(&note).Error; err != nil {
 		log.Printf("insert note: %v", err)
 		writeError(w, http.StatusInternalServerError, "保存批注失败")
 		return
 	}
-	id, _ := res.LastInsertId()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"id": id, "articleId": articleID, "paragraphId": req.ParagraphID,
+		"id": note.ID, "articleId": articleID, "paragraphId": req.ParagraphID,
 		"sentenceIndex": req.SentenceIndex, "content": req.Content,
 	})
 }
@@ -270,12 +269,14 @@ func (s *Server) handleDeleteNote(w http.ResponseWriter, r *http.Request, user a
 		writeError(w, http.StatusBadRequest, "无效的批注 ID")
 		return
 	}
-	res, err := s.db.Exec(`DELETE FROM notes WHERE id = ? AND user_id = ? AND article_id = ?`, noteID, user.ID, articleID)
-	if err != nil {
+	res := s.db.Where("id = ? AND user_id = ? AND article_id = ?", noteID, user.ID, articleID).
+		Delete(&store.Note{})
+	if res.Error != nil {
+		log.Printf("delete note: %v", res.Error)
 		writeError(w, http.StatusInternalServerError, "删除失败")
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if res.RowsAffected == 0 {
 		writeError(w, http.StatusNotFound, "批注不存在")
 		return
 	}
@@ -314,19 +315,19 @@ func (s *Server) handleTranslate(w http.ResponseWriter, r *http.Request, user au
 	}
 
 	// Return the user's own saved translation when it exists.
-	var existing translationDTO
-	err = s.db.QueryRow(`
-		SELECT id, article_id, paragraph_id, sentence_index, source_text, translated_text
-		FROM user_translations
-		WHERE user_id = ? AND article_id = ? AND paragraph_id = ? AND sentence_index = ?`,
-		user.ID, articleID, req.ParagraphID, req.SentenceIndex).
-		Scan(&existing.ID, &existing.ArticleID, &existing.ParagraphID, &existing.SentenceIndex,
-			&existing.SourceText, &existing.TranslatedText)
+	var existing store.UserTranslation
+	err = s.db.Where("user_id = ? AND article_id = ? AND paragraph_id = ? AND sentence_index = ?",
+		user.ID, articleID, req.ParagraphID, req.SentenceIndex).Take(&existing).Error
 	if err == nil {
-		writeJSON(w, http.StatusOK, existing)
+		writeJSON(w, http.StatusOK, translationDTO{
+			ID: existing.ID, ArticleID: existing.ArticleID, ParagraphID: existing.ParagraphID,
+			SentenceIndex: existing.SentenceIndex, SourceText: existing.SourceText,
+			TranslatedText: existing.TranslatedText,
+		})
 		return
 	}
-	if err != sql.ErrNoRows {
+	if !store.IsNotFound(err) {
+		log.Printf("load translation: %v", err)
 		writeError(w, http.StatusInternalServerError, "读取翻译记录失败")
 		return
 	}
@@ -338,17 +339,14 @@ func (s *Server) handleTranslate(w http.ResponseWriter, r *http.Request, user au
 		return
 	}
 
-	var savedID int64
-	err = s.db.QueryRow(`
-		INSERT INTO user_translations
-			(user_id, article_id, paragraph_id, sentence_index, source_text, translated_text)
-		VALUES(?, ?, ?, ?, ?, ?)
-		ON CONFLICT(user_id, article_id, paragraph_id, sentence_index)
-		DO UPDATE SET source_text = excluded.source_text,
-		              translated_text = excluded.translated_text,
-		              updated_at = CURRENT_TIMESTAMP
-		RETURNING id`,
-		user.ID, articleID, req.ParagraphID, req.SentenceIndex, text, translated).Scan(&savedID)
+	row := store.UserTranslation{
+		UserID: user.ID, ArticleID: articleID, ParagraphID: req.ParagraphID,
+		SentenceIndex: req.SentenceIndex, SourceText: text, TranslatedText: translated,
+	}
+	savedID, err := store.UpsertReturningID(s.db, &row,
+		upsertOnColumns(userTranslationKey, []string{"source_text", "translated_text", "updated_at"}),
+		"user_id = ? AND article_id = ? AND paragraph_id = ? AND sentence_index = ?",
+		[]any{user.ID, articleID, req.ParagraphID, req.SentenceIndex})
 	if err != nil {
 		log.Printf("insert translation: %v", err)
 		writeError(w, http.StatusInternalServerError, "保存翻译失败")
@@ -362,20 +360,27 @@ func (s *Server) handleTranslate(w http.ResponseWriter, r *http.Request, user au
 
 func (s *Server) cachedTranslate(text string) (string, error) {
 	hash := hashText(text)
-	var cached string
-	err := s.db.QueryRow(`SELECT translated_text FROM translation_cache WHERE source_hash = ?`, hash).Scan(&cached)
+
+	var cached store.TranslationCache
+	err := s.db.Where("source_hash = ?", hash).Take(&cached).Error
 	if err == nil {
-		return cached, nil
+		return cached.TranslatedText, nil
 	}
-	if err != sql.ErrNoRows {
+	if !store.IsNotFound(err) {
 		return "", err
 	}
+
 	translated, err := s.translate.Translate(text, "en", "zh-CN")
 	if err != nil {
 		return "", err
 	}
-	if _, err := s.db.Exec(`INSERT OR IGNORE INTO translation_cache(source_hash, source_text, translated_text, target)
-		VALUES(?, ?, ?, 'zh-CN')`, hash, text, translated); err != nil {
+	// Another request may have cached the same text meanwhile; ignore the
+	// collision, exactly like the previous INSERT OR IGNORE.
+	if err := s.db.Clauses(clause.OnConflict{DoNothing: true}).
+		Create(&store.TranslationCache{
+			SourceHash: hash, SourceText: text,
+			TranslatedText: translated, Target: "zh-CN",
+		}).Error; err != nil {
 		log.Printf("cache translation: %v", err)
 	}
 	return translated, nil
@@ -392,13 +397,14 @@ func (s *Server) handleDeleteTranslation(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, "无效的翻译 ID")
 		return
 	}
-	res, err := s.db.Exec(`DELETE FROM user_translations WHERE id = ? AND user_id = ? AND article_id = ?`,
-		translationID, user.ID, articleID)
-	if err != nil {
+	res := s.db.Where("id = ? AND user_id = ? AND article_id = ?", translationID, user.ID, articleID).
+		Delete(&store.UserTranslation{})
+	if res.Error != nil {
+		log.Printf("delete translation: %v", res.Error)
 		writeError(w, http.StatusInternalServerError, "删除失败")
 		return
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
+	if res.RowsAffected == 0 {
 		writeError(w, http.StatusNotFound, "翻译记录不存在")
 		return
 	}
@@ -412,19 +418,18 @@ var errParagraphNotFound = errors.New("段落不存在")
 // sentenceText resolves the source text for either a paragraph
 // (sentenceIndex == -1) or one sentence inside it.
 func (s *Server) sentenceText(articleID, paragraphID int64, sentenceIndex int) (string, error) {
-	var kind, content string
-	err := s.db.QueryRow(`SELECT kind, content FROM paragraphs WHERE id = ? AND article_id = ?`,
-		paragraphID, articleID).Scan(&kind, &content)
-	if err == sql.ErrNoRows {
+	var p store.Paragraph
+	err := s.db.Where("id = ? AND article_id = ?", paragraphID, articleID).Take(&p).Error
+	if store.IsNotFound(err) {
 		return "", errParagraphNotFound
 	}
 	if err != nil {
 		return "", err
 	}
 	if sentenceIndex < 0 {
-		return content, nil
+		return p.Content, nil
 	}
-	sentences := sentence.Split(content)
+	sentences := sentence.Split(p.Content)
 	if sentenceIndex >= len(sentences) {
 		return "", fmt.Errorf("句子序号已失效")
 	}
